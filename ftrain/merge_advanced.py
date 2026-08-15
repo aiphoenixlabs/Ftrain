@@ -1,6 +1,3 @@
-"""
-🔥 FTRAIN Advanced Merging (v8.0.6) 🔥
-"""
 
 import torch
 import logging
