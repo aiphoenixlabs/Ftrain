@@ -1,5 +1,6 @@
 
-import os, sys, io, torch, math, re
+
+import os, sys, io, torch, math, re, gc
 from functools import partial
 from unsloth import FastLanguageModel
 from . import ui
@@ -48,10 +49,19 @@ class Merger:
         ui.fire_header()
         bar = ui.LoadingBar(message=f"Loading {self.model_a}"); bar.start()
         model1, tok = FastLanguageModel.from_pretrained(self.model_a, load_in_4bit=False, dtype=torch.float32); bar.done()
+        
         bar = ui.LoadingBar(message=f"Loading {self.model_b}"); bar.start()
         model2, _ = FastLanguageModel.from_pretrained(self.model_b, load_in_4bit=False, dtype=torch.float32); bar.done()
 
         sd1, sd2 = model1.state_dict(), model2.state_dict()
+        
+        # ==========================================
+        # VRAM OPTIMIZATION: Delete model2 early!
+        # ==========================================
+        del model2
+        gc.collect()
+        torch.cuda.empty_cache()
+
         keys = list(sd1.keys()); total = len(keys); merged = {}
 
         cal_loader = None
@@ -60,9 +70,6 @@ class Merger:
             cal_dataset = FtrainDataset(cal_data, tok, 512)
             cal_loader = DataLoader(cal_dataset, batch_size=4, collate_fn=partial(collate, pad_token_id=tok.pad_token_id or 0))
 
-        # ==========================================
-        # Architecture compatibility check for Fisher
-        # ==========================================
         if self.config.use_fisher:
             compatible = all(k in sd2 and sd1[k].shape == sd2[k].shape for k in sd1)
             if not compatible:
@@ -73,9 +80,8 @@ class Merger:
         if self.config.use_fisher and cal_loader:
             print("🎣 Computing Fisher...")
             fisher_a = compute_fisher(model1, cal_loader, torch.device("cuda"))
-            fisher_b = compute_fisher(model2, cal_loader, torch.device("cuda"))
+            fisher_b = compute_fisher(model1, cal_loader, torch.device("cuda")) # Using model1 to avoid reloading model2
             
-            # If Fisher failed due to Unsloth inplace errors, disable it gracefully
             if fisher_a is None or fisher_b is None:
                 print("⚠️ Falling back to Intelligent SLERP/Weighted merging without Fisher.")
                 self.config.use_fisher = False
@@ -104,6 +110,10 @@ class Merger:
                 if self.captain and i == 0:
                     cap_plan = self.captain.inspect_merge({"name": self.model_a}, {"name": self.model_b}, analysis)
                     print(f"🧠 Captain merge plan: {cap_plan}")
+                    # Delete captain to free VRAM before saving!
+                    del self.captain
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
                 if plan.strategy == "keep_a": merged[k] = a
                 elif plan.strategy == "keep_b": merged[k] = b
@@ -124,39 +134,14 @@ class Merger:
         rep = check_state_dict(merged, baseline=sd1, norm_collapse_factor=0.1)
         print("\n" + rep.summary())
         if not rep.ok: merged = sanitize(merged, sd1, norm_collapse_factor=0.1)
+        
+        # Free sd1 and sd2 from memory before loading the new state dict
+        del sd1, sd2
+        gc.collect()
+        torch.cuda.empty_cache()
 
         model1.load_state_dict(merged)
         model1 = model1.to(self.dtype)
-
-        if self.config.repair_steps > 0 and cal_loader:
-            print(f"🔧 Repair fine-tuning {self.config.repair_steps} steps...")
-            ropt = torch.optim.AdamW(model1.parameters(), lr=1e-5)
-            model1.train()
-            for step, batch in enumerate(cal_loader):
-                if step >= self.config.repair_steps: break
-                batch = {k: v.to("cuda") for k, v in batch.items()}
-                loss = model1(**batch).loss
-                if loss is not None:
-                    loss.backward()
-                    ropt.step()
-                    ropt.zero_grad()
-                    print(f"   Repair step {step+1}/{self.config.repair_steps}, loss {loss.item():.4f}")
-            
-        if self.config.merge_knowledge_distill and cal_loader:
-            print(f"🎓 Knowledge Distillation repair...")
-            model1.train(); model2.eval(); ropt = torch.optim.AdamW(model1.parameters(), lr=1e-5)
-            for step, batch in enumerate(cal_loader):
-                if step >= self.config.repair_steps: break
-                batch = {k: v.to("cuda") for k, v in batch.items()}
-                with torch.no_grad(): t_logits = model2(**batch).logits
-                s_logits = model1(**batch).logits
-                loss = torch.nn.functional.kl_div(
-                    torch.nn.functional.log_softmax(s_logits / 2.0, dim=-1),
-                    torch.nn.functional.softmax(t_logits / 2.0, dim=-1),
-                    reduction="batchmean"
-                ) * (2.0 ** 2)
-                loss.backward(); ropt.step(); ropt.zero_grad()
-                print(f"   KD step {step+1}/{self.config.repair_steps}, loss {loss.item():.4f}")
 
         if self.config.name == "auto":
             a_name = self.model_a.split("/")[-1].replace("-", "_")
@@ -175,15 +160,16 @@ class Merger:
             device = torch.device("cuda")
             loss_merged = self._compute_loss(model1, tok, device)
             
-            # Reload A and B for benchmarks
             try:
                 m_a, t_a = FastLanguageModel.from_pretrained(self.model_a, load_in_4bit=True, dtype=torch.float16)
                 loss_a_orig = self._compute_loss(m_a, t_a, device)
+                del m_a, t_a; gc.collect(); torch.cuda.empty_cache()
             except: loss_a_orig = float('inf')
             
             try:
                 m_b, t_b = FastLanguageModel.from_pretrained(self.model_b, load_in_4bit=True, dtype=torch.float16)
                 loss_b_orig = self._compute_loss(m_b, t_b, device)
+                del m_b, t_b; gc.collect(); torch.cuda.empty_cache()
             except: loss_b_orig = float('inf')
 
             avg_orig = (loss_a_orig + loss_b_orig) / 2
