@@ -1,5 +1,4 @@
 
-
 import logging
 import math
 import torch
@@ -9,11 +8,6 @@ from typing import Dict, Any, Iterator, Optional, Union, List
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# 🎣 FISHER INFORMATION COMPUTATION (VRAM-Optimized & AMP-Safe)
-# ============================================================================
-
 def compute_fisher(
     model: nn.Module,
     loader: Iterator,
@@ -21,14 +15,9 @@ def compute_fisher(
     num_samples: int = 50,
     use_amp: bool = True
 ) -> Optional[Dict[str, torch.Tensor]]:
-    """
-    Computes diagonal empirical Fisher Information Matrix (FIM).
-    Accumulates estimates directly on CPU RAM to preserve GPU memory.
-    """
     model.eval()
     fisher: Dict[str, torch.Tensor] = {}
     
-    # Initialize Fisher accumulator on CPU RAM
     for name, param in model.named_parameters():
         if param.requires_grad:
             fisher[name] = torch.zeros(param.shape, dtype=torch.float32, device="cpu")
@@ -65,7 +54,6 @@ def compute_fisher(
 
             loss.backward()
 
-            # Offload square gradients to CPU
             with torch.no_grad():
                 for name, param in model.named_parameters():
                     if param.grad is not None and name in fisher:
@@ -78,7 +66,6 @@ def compute_fisher(
             logger.error("❌ Zero valid samples processed during Fisher computation.")
             return None
 
-        # Normalize across processed samples
         actual_samples = float(max(1, samples_processed))
         with torch.no_grad():
             for name in fisher:
@@ -91,11 +78,6 @@ def compute_fisher(
         logger.warning(f"⚠️ Fisher computation failed: {str(e)}. Falling back to safe merge.")
         return None
 
-
-# ============================================================================
-# 🎲 DARE (Drop And REscale) MERGING
-# ============================================================================
-
 def dare_merge(
     da: torch.Tensor,
     db: torch.Tensor,
@@ -103,10 +85,6 @@ def dare_merge(
     rescale: bool = True,
     seed: Optional[int] = None
 ) -> torch.Tensor:
-    """
-    Applies Drop And REscale (DARE) algorithm between two parameter tensors.
-    Operates Bernoulli sampling in FP32 for numerical stability across FP16/BF16.
-    """
     if da.shape != db.shape:
         raise ValueError(f"Tensor shape mismatch in DARE merge: {da.shape} vs {db.shape}")
 
@@ -124,10 +102,8 @@ def dare_merge(
         else:
             generator = None
 
-        # Calculate difference vector (Delta)
         delta = (db - da).to(torch.float32)
         
-        # Bernoulli mask generated in FP32
         keep_prob = 1.0 - drop_rate
         mask = torch.bernoulli(
             torch.full_like(delta, keep_prob, device=device),
@@ -140,11 +116,6 @@ def dare_merge(
         res = da.to(torch.float32) + (delta * mask)
         return res.to(dtype=target_dtype)
 
-
-# ============================================================================
-# 💥 TASK ARITHMETIC WITH NORM GUARD
-# ============================================================================
-
 def task_arithmetic(
     ma: Dict[str, torch.Tensor],
     mb: Dict[str, torch.Tensor],
@@ -152,9 +123,6 @@ def task_arithmetic(
     scaling: float = 0.5,
     max_norm_ratio: float = 2.5
 ) -> Dict[str, torch.Tensor]:
-    """
-    Combines task vectors (ma - base) and (mb - base) with norm expansion safeguards.
-    """
     merged: Dict[str, torch.Tensor] = {}
 
     with torch.no_grad():
@@ -165,18 +133,15 @@ def task_arithmetic(
             ta = (ma[k] - p_base).to(torch.float32)
             tb = (mb[k] - p_base).to(torch.float32) if k in mb else torch.zeros_like(ta)
 
-            # Combined task delta
             combined_delta = scaling * (ta + tb)
             base_fp32 = p_base.to(torch.float32)
             candidate = base_fp32 + combined_delta
 
-            # Norm Guard check
             base_norm = float(base_fp32.norm()) + 1e-8
             cand_norm = float(candidate.norm())
             ratio = cand_norm / base_norm
 
             if ratio > max_norm_ratio:
-                # Clamp magnitude expansion
                 combined_delta.mul_(max_norm_ratio * base_norm / cand_norm)
                 candidate = base_fp32 + combined_delta
 
@@ -184,20 +149,12 @@ def task_arithmetic(
 
     return merged
 
-
-# ============================================================================
-# 👔 TIES (Trimming, Electing Sign, & Merging) ENGINE
-# ============================================================================
-
 def ties_merge_state_dict(
     models: List[Dict[str, torch.Tensor]],
     base: Dict[str, torch.Tensor],
     density: float = 0.2,
     scaling: float = 1.0
 ) -> Dict[str, torch.Tensor]:
-    """
-    Full TIES (Trimming, Electing Sign, & Merging) pipeline for arbitrary state dicts.
-    """
     merged: Dict[str, torch.Tensor] = {}
 
     with torch.no_grad():
@@ -211,10 +168,8 @@ def ties_merge_state_dict(
                 merged[k] = p_base
                 continue
 
-            # Stack deltas: [Num_Models, Tensor_Shape...]
             stacked_deltas = torch.stack(deltas, dim=0)
 
-            # 1. Trimming (Keep top-K magnitude deltas per model)
             if density < 1.0:
                 k_val = max(1, int(stacked_deltas.numel() / len(models) * density))
                 flat_deltas = stacked_deltas.abs().view(len(models), -1)
@@ -222,15 +177,12 @@ def ties_merge_state_dict(
                 mask = stacked_deltas.abs() >= thresholds
                 stacked_deltas.mul_(mask.float())
 
-            # 2. Electing Sign (Majority vote across models)
             sign_votes = torch.sign(stacked_deltas).sum(dim=0)
             elected_sign = torch.sign(sign_votes)
 
-            # 3. Disjoint Merging (Keep parameters matching elected sign)
             matching_mask = (torch.sign(stacked_deltas) == elected_sign.unsqueeze(0)) & (elected_sign.unsqueeze(0) != 0)
             filtered_deltas = stacked_deltas * matching_mask.float()
 
-            # Average matching deltas across contributing models
             counts = matching_mask.sum(dim=0).clamp(min=1)
             final_delta = (filtered_deltas.sum(dim=0) / counts) * scaling
 
