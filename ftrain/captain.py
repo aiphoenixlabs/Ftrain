@@ -180,7 +180,29 @@ class PhoenixCaptain:
             self._last_result = rule_res
         self.memory.append({"step": step, "loss": loss, "advice": rule_res.get("action", "")})
         return rule_res
+        def inspect_merge(self, info1: Dict[str, Any], info2: Dict[str, Any], tensor_analysis: Optional[Dict] = None) -> Dict[str, Any]:
+        """Inspects tensor statistics for model merging and provides strategy recommendations."""
+        sim = tensor_analysis.get("similarity", 0.5) if tensor_analysis else 0.5
+        cat = tensor_analysis.get("category", "other") if tensor_analysis else "other"
 
+        if sim < 0.3 and cat not in ("norm", "router"):
+            return {
+                "action": "keep_a",
+                "alpha": 1.0,
+                "reason": f"Low similarity ({sim:.2f}) in {cat} tensor. Retaining primary model weights."
+            }
+        elif sim > 0.85:
+            return {
+                "action": "weighted_average",
+                "alpha": 0.5,
+                "reason": f"High similarity ({sim:.2f}) in {cat} tensor. Standard linear blending safe."
+            }
+        else:
+            return {
+                "action": "slerp",
+                "alpha": 0.5,
+                "reason": f"Moderate similarity ({sim:.2f}) in {cat} tensor. Recommending spherical interpolation."
+            }
     def get_latest_advice(self):
         with self._lock:
             if self._last_result and self._last_result != self._last_applied:
