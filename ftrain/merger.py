@@ -1,6 +1,3 @@
-"""
-🔥 FTRAIN Intelligent Merger (v9.0.1 - Extreme VRAM) 🔥
-"""
 
 import os, sys, io, torch, math, re, gc
 import torch.nn.functional as F
@@ -88,21 +85,31 @@ class Merger:
 
     def _align_tensor_shapes(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         if a.shape == b.shape: return b
-        b_work = b.to(dtype=torch.float32, device=a.device)
-        a_dim, b_dim = a.dim(), b.dim()
+        
+        # ==========================================
+        # VRAM OPTIMIZATION: Do interpolation on CPU RAM!
+        # ==========================================
+        device = a.device
+        a_cpu = a.detach().to("cpu", dtype=torch.float32)
+        b_cpu = b.detach().to("cpu", dtype=torch.float32)
+        
+        a_dim, b_dim = a_cpu.dim(), b_cpu.dim()
+
         if a_dim == 1 and b_dim == 1:
-            b_reshaped = b_work.unsqueeze(0).unsqueeze(0)
-            b_aligned = F.interpolate(b_reshaped, size=(a.shape[0],), mode='linear', align_corners=False)
-            return b_aligned.squeeze(0).squeeze(0).to(a.dtype)
+            b_reshaped = b_cpu.unsqueeze(0).unsqueeze(0)
+            b_aligned = F.interpolate(b_reshaped, size=(a_cpu.shape[0],), mode='linear', align_corners=False)
+            return b_aligned.squeeze(0).squeeze(0).to(a.dtype).to(device)
+
         elif a_dim == 2 and b_dim == 2:
-            b_reshaped = b_work.unsqueeze(0).unsqueeze(0)
-            b_aligned = F.interpolate(b_reshaped, size=(a.shape[0], a.shape[1]), mode='bilinear', align_corners=False)
-            return b_aligned.squeeze(0).squeeze(0).to(a.dtype)
+            b_reshaped = b_cpu.unsqueeze(0).unsqueeze(0)
+            b_aligned = F.interpolate(b_reshaped, size=(a_cpu.shape[0], a_cpu.shape[1]), mode='bilinear', align_corners=False)
+            return b_aligned.squeeze(0).squeeze(0).to(a.dtype).to(device)
+
         else:
-            out = torch.zeros_like(a, dtype=torch.float32, device=a.device)
-            slices = tuple(slice(0, min(sa, sb)) for sa, sb in zip(a.shape, b.shape))
-            out[slices] = b_work[slices]
-            return out.to(a.dtype)
+            out = torch.zeros_like(a_cpu, dtype=torch.float32)
+            slices = tuple(slice(0, min(sa, sb)) for sa, sb in zip(a_cpu.shape, b_cpu.shape))
+            out[slices] = b_cpu[slices]
+            return out.to(a.dtype).to(device)
 
     def merge(self) -> bool:
         ui.fire_header()
@@ -132,13 +139,13 @@ class Merger:
         bar = ui.LoadingBar(message=f"Loading {self.model_a} (CPU State Dict)"); bar.start()
         model1, tok = FastLanguageModel.from_pretrained(self.model_a, load_in_4bit=False, dtype=torch.float16)
         sd1 = {k: v.cpu() for k, v in model1.state_dict().items()}
-        del model1; self._purge_memory()  # <--- THE FIX: DELETE MODEL1 FROM VRAM
+        del model1; self._purge_memory()  # DELETE MODEL1 FROM VRAM
         bar.done()
 
         bar = ui.LoadingBar(message=f"Loading {self.model_b} (CPU State Dict)"); bar.start()
         model2, _ = FastLanguageModel.from_pretrained(self.model_b, load_in_4bit=False, dtype=torch.float16)
         sd2 = {k: v.cpu() for k, v in model2.state_dict().items()}
-        del model2; self._purge_memory()  # <--- THE FIX: DELETE MODEL2 FROM VRAM
+        del model2; self._purge_memory()  # DELETE MODEL2 FROM VRAM
         bar.done()
 
         num_layers_a = self._get_num_layers(sd1)
