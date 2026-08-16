@@ -1,5 +1,4 @@
 
-
 import os, sys, io, torch, math, re, gc
 from functools import partial
 from unsloth import FastLanguageModel
@@ -56,7 +55,7 @@ class Merger:
         sd1, sd2 = model1.state_dict(), model2.state_dict()
         
         # ==========================================
-        # VRAM OPTIMIZATION: Delete model2 early!
+        # VRAM OPTIMIZATION 1: Delete model2 early!
         # ==========================================
         del model2
         gc.collect()
@@ -110,7 +109,10 @@ class Merger:
                 if self.captain and i == 0:
                     cap_plan = self.captain.inspect_merge({"name": self.model_a}, {"name": self.model_b}, analysis)
                     print(f"🧠 Captain merge plan: {cap_plan}")
-                    # Delete captain to free VRAM before saving!
+                    
+                    # ==========================================
+                    # VRAM OPTIMIZATION 2: Delete Captain LLM!
+                    # ==========================================
                     del self.captain
                     gc.collect()
                     torch.cuda.empty_cache()
@@ -131,12 +133,21 @@ class Merger:
                 else: merged[k] = a
             else: merged[k] = (self.alpha * a.float() + (1 - self.alpha) * b.float()).to(a.dtype)
 
+        # ==========================================
+        # VRAM OPTIMIZATION 3: Delete sd2 BEFORE Safety Check!
+        # ==========================================
+        del sd2
+        gc.collect()
+        torch.cuda.empty_cache()
+
         rep = check_state_dict(merged, baseline=sd1, norm_collapse_factor=0.1)
         print("\n" + rep.summary())
         if not rep.ok: merged = sanitize(merged, sd1, norm_collapse_factor=0.1)
         
-        # Free sd1 and sd2 from memory before loading the new state dict
-        del sd1, sd2
+        # ==========================================
+        # VRAM OPTIMIZATION 4: Delete sd1 BEFORE loading merged weights!
+        # ==========================================
+        del sd1
         gc.collect()
         torch.cuda.empty_cache()
 
