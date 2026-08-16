@@ -1,18 +1,54 @@
-from dataclasses import dataclass
+
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional
+import re
+import math
+import torch
 from .tensor_stats import compute_tensor_stats
 from .similarity import similarity_bundle, aggregate_similarity
 
-def classify_tensor(name):
+# Default Category Base Alpha Profiles
+CAT_ALPHA = {
+    "embedding": 0.85,
+    "lm_head": 0.15,
+    "norm": 1.00,
+    "router": 1.00,
+    "shared_expert": 0.60,
+    "moe_expert": 0.50,
+    "attention": 0.65,
+    "ffn": 0.40,
+    "other": 0.50
+}
+
+def classify_tensor(name: str) -> str:
+    """Classifies parameter keys into structural categories across all standard model architectures."""
     n = name.lower()
-    if "embed" in n: return "embedding"
-    if "lm_head" in n: return "lm_head"
-    if "norm" in n: return "norm"
-    if "router" in n or ".mlp.gate." in n: return "router"
-    if any(k in n for k in ("q_proj", "k_proj", "v_proj", "o_proj")): return "attention"
-    if any(k in n for k in ("gate_proj", "up_proj", "down_proj")): return "ffn"
+    if any(k in n for k in ("embed", "wte", "tok_embeddings")):
+        return "embedding"
+    if any(k in n for k in ("lm_head", "output.weight")):
+        return "lm_head"
+    if any(k in n for k in ("norm", "ln_f", "layernorm")):
+        return "norm"
+    if any(k in n for k in ("router", "gate.weight", ".mlp.gate.", "wg")):
+        return "router"
+    if any(k in n for k in ("shared_experts", "shared_mlp")):
+        return "shared_expert"
+    if any(k in n for k in ("expert", "mlp.experts")):
+        return "moe_expert"
+    if any(k in n for k in ("q_proj", "k_proj", "v_proj", "o_proj", "wq", "wk", "wv", "wo", "qkv", "kv_a", "kv_b")):
+        return "attention"
+    if any(k in n for k in ("gate_proj", "up_proj", "down_proj", "w1", "w2", "w3", "mlp")):
+        return "ffn"
     return "other"
 
-CAT_ALPHA = {"embedding": 0.9, "lm_head": 0.0, "norm": 1.0, "router": 1.0, "attention": 0.65, "ffn": 0.40, "other": 0.5}
+def extract_layer_depth(name: str, total_layers: int = 32) -> float:
+    """Extracts relative layer depth [0.0 - 1.0] from parameter key name."""
+    match = re.search(r'(?:layers|h)\.(\d+)\.', name)
+    if match:
+        layer_idx = int(match.group(1))
+        return min(1.0, max(0.0, layer_idx / max(1, total_layers - 1)))
+    return 0.5
+
 
 @dataclass
 class TensorMergePlan:
@@ -22,36 +58,86 @@ class TensorMergePlan:
     strategy: str
     projection: str = "identity"
     similarity: float = 0.0
+    layer_depth: float = 0.5
+    importance_a: float = 0.5
+    importance_b: float = 0.5
+    reason: str = ""
+
 
 class MergeAnalyzer:
-    def analyze_pair(self, name, a, b):
-        sa, sb = compute_tensor_stats(name, a), compute_tensor_stats(name, b)
-        sim = aggregate_similarity(similarity_bundle(a, b)) if a.shape == b.shape else 0.0
-        return {"a": sa, "b": sb, "similarity": sim, "category": classify_tensor(name)}
+    """Computes multidimensional similarity & information-theoretic metrics for tensor pairs."""
+    
+    def analyze_pair(self, name: str, a: torch.Tensor, b: torch.Tensor, total_layers: int = 32) -> Dict[str, Any]:
+        sa = compute_tensor_stats(name, a)
+        sb = compute_tensor_stats(name, b)
+        
+        sim = 0.0
+        if a.shape == b.shape and a.numel() > 0:
+            sim = aggregate_similarity(similarity_bundle(a, b))
+
+        layer_depth = extract_layer_depth(name, total_layers)
+        category = classify_tensor(name)
+
+        return {
+            "a": sa,
+            "b": sb,
+            "similarity": sim,
+            "category": category,
+            "layer_depth": layer_depth
+        }
+
 
 class MergePlanner:
-    def plan_for_pair(self, name, an):
-        cat, base, sim = an["category"], CAT_ALPHA.get(an["category"], 0.5), an["similarity"]
+    """Determines hyper-optimized merge strategies and blending ratios per tensor pair."""
+    
+    def plan_for_pair(self, name: str, an: Dict[str, Any]) -> TensorMergePlan:
+        cat = an["category"]
+        sim = an["similarity"]
+        depth = an["layer_depth"]
         sa, sb = an["a"], an["b"]
-        na = max(sa.l2_norm * (0.5 + sa.effective_rank), 1e-6)
-        nb = max(sb.l2_norm * (0.5 + sb.effective_rank), 1e-6)
-        imp = na / (na + nb)
-        sa_ = base if sim > 0.9 else (0.5 * base + 0.25 if sim > 0.6 else 0.5)
-        a = max(0.05, min(0.95, 0.5 * sa_ + 0.3 * imp + 0.2 * (0.5 + 0.5 * (sa.entropy - sb.entropy))))
-        if sb.std > sa.std * 1.5 and cat in ("attention", "ffn"):
-            a = max(0.1, a - 0.2)
-        if sim < 0.2 and cat not in ("norm", "router"):
-            return TensorMergePlan(name, cat, 1.0, "keep_a", "identity", sim)
-        if cat in ("router", "norm"):
-            return TensorMergePlan(name, cat, 1.0, "keep_a", "identity", sim)
+        base_alpha = CAT_ALPHA.get(cat, 0.50)
+
+        # 1. Handle Dead / Zeroed Tensors
         if sa.dead and not sb.dead:
-            return TensorMergePlan(name, cat, 0.0, "keep_b", "identity", sim)
+            return TensorMergePlan(name, cat, 0.0, "keep_b", "identity", sim, depth, 0.0, 1.0, "Model A tensor dead")
         if sb.dead and not sa.dead:
-            return TensorMergePlan(name, cat, 1.0, "keep_a", "identity", sim)
+            return TensorMergePlan(name, cat, 1.0, "keep_a", "identity", sim, depth, 1.0, 0.0, "Model B tensor dead")
+
+        # 2. Critical Parameter Preservation (Norms & Routers)
+        if cat in ("router", "norm"):
+            return TensorMergePlan(name, cat, 1.0, "keep_a", "identity", sim, depth, 1.0, 0.0, "Preserving critical structure")
+
+        # 3. Calculate Relative Importance Score
+        imp_a = max(sa.l2_norm * (0.5 + sa.effective_rank) * (1.0 + sa.entropy), 1e-6)
+        imp_b = max(sb.l2_norm * (0.5 + sb.effective_rank) * (1.0 + sb.entropy), 1e-6)
+        rel_imp_a = imp_a / (imp_a + imp_b)
+
+        # 4. Layer Depth-Aware Alpha Tuning
+        # Early layers (structural representation) favor Model A; Middle layers blend evenly; Late layers favor Model A
+        depth_modifier = 0.1 * math.cos(depth * math.pi * 2) if 'math' in globals() else 0.0
+        
+        # 5. Compute Blended Dynamic Alpha
+        sim_factor = base_alpha if sim > 0.90 else (0.5 * base_alpha + 0.25 if sim > 0.60 else 0.50)
+        entropy_delta = sa.entropy - sb.entropy
+        
+        alpha = 0.40 * sim_factor + 0.35 * rel_imp_a + 0.15 * (0.5 + 0.5 * entropy_delta) + 0.10 * depth_modifier
+        alpha = max(0.05, min(0.95, alpha))
+
+        # Variance/Std adjustment for Attention & FFN
+        if sb.std > sa.std * 1.5 and cat in ("attention", "ffn"):
+            alpha = max(0.10, alpha - 0.15)
+
+        # 6. Strategy Selection Matrix based on Geometric Similarity
+        if sim < 0.20:
+            return TensorMergePlan(name, cat, 1.0, "keep_a", "identity", sim, depth, rel_imp_a, 1.0 - rel_imp_a, "Orthogonal feature space")
+
         if sim > 0.85:
-            return TensorMergePlan(name, cat, a, "weighted", "identity", sim)
+            return TensorMergePlan(name, cat, alpha, "weighted", "identity", sim, depth, rel_imp_a, 1.0 - rel_imp_a, "High alignment weighted blend")
+
         if sim > 0.55:
-            return TensorMergePlan(name, cat, a, "slerp", "identity", sim)
+            return TensorMergePlan(name, cat, alpha, "slerp", "identity", sim, depth, rel_imp_a, 1.0 - rel_imp_a, "Spherical interpolation")
+
         if sa.shape == sb.shape and sa.numel >= 16:
-            return TensorMergePlan(name, cat, a, "ties", "identity", sim)
-        return TensorMergePlan(name, cat, a, "projection", "procrustes", sim)
+            return TensorMergePlan(name, cat, alpha, "ties", "identity", sim, depth, rel_imp_a, 1.0 - rel_imp_a, "TIES sign-resolution merge")
+
+        return TensorMergePlan(name, cat, alpha, "projection", "procrustes", sim, depth, rel_imp_a, 1.0 - rel_imp_a, "Procrustes manifold alignment")
