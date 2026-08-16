@@ -1,5 +1,4 @@
 
-
 import math, torch
 from dataclasses import dataclass, field
 from typing import List, Tuple, Any
@@ -17,7 +16,6 @@ def compute_tensor_stats(name: str, t: torch.Tensor) -> TensorStats:
     if t.numel() == 0:
         s.dead = True; return s
         
-    # Don't duplicate the tensor if it's already float32
     if t.dtype == torch.float32:
         tf = t.detach()
     else:
