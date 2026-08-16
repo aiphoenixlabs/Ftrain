@@ -5,25 +5,18 @@ import torch.nn.functional as F
 from typing import Dict, Any, Tuple
 
 def _flatten_2d(t: torch.Tensor) -> torch.Tensor:
-    """Reshapes tensors of arbitrary rank into 2D matrices [Rows, Features]."""
     if t.dim() <= 2:
         return t.reshape(-1, t.shape[-1]) if t.dim() == 2 else t.unsqueeze(0)
     return t.reshape(t.shape[0], -1)
 
 def _safe_subsample(a: torch.Tensor, b: torch.Tensor, max_rows: int = 2048) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Flattens, aligns columns, and aggressively subsamples rows to prevent OOM.
-    This guarantees that no NxN matrix operation ever exceeds 2048x2048 (~16MB).
-    """
     a_f = _flatten_2d(a.detach().to(torch.float32))
     b_f = _flatten_2d(b.detach().to(torch.float32))
 
-    # Align feature dimensions if different
     if a_f.shape[1] != b_f.shape[1]:
         n_cols = min(a_f.shape[1], b_f.shape[1])
         a_f, b_f = a_f[:, :n_cols], b_f[:, :n_cols]
 
-    # Aggressive subsampling to bound memory footprint
     if a_f.shape[0] > max_rows:
         a_f = a_f[:max_rows]
         b_f = b_f[:max_rows]
@@ -31,8 +24,6 @@ def _safe_subsample(a: torch.Tensor, b: torch.Tensor, max_rows: int = 2048) -> T
     return a_f, b_f
 
 def cosine_similarity_weights(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Computes global element-wise cosine similarity between two tensors."""
-    # Use subsampling to prevent massive 1D array allocations on embeddings
     a_f, b_f = _safe_subsample(a, b, max_rows=4096)
     a_flat = a_f.reshape(-1)
     b_flat = b_f.reshape(-1)
@@ -51,11 +42,6 @@ def cosine_similarity_weights(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.clamp(sim, -1.0, 1.0).item())
 
 def cka(a: torch.Tensor, b: torch.Tensor, kernel: str = "linear") -> float:
-    """
-    Computes Centered Kernel Alignment (CKA) between two representations.
-    CKA(K, L) = HSIC(K, L) / sqrt(HSIC(K, K) * HSIC(L, L))
-    """
-    # Hard cap at 2048 rows to prevent OOM in NxN matrix multiplication
     a_f, b_f = _safe_subsample(a, b, max_rows=2048)
     n = a_f.shape[0]
     
@@ -66,7 +52,6 @@ def cka(a: torch.Tensor, b: torch.Tensor, kernel: str = "linear") -> float:
         ga = a_f @ a_f.T
         gb = b_f @ b_f.T
     else:
-        # RBF Kernel with Adaptive Median Distance Heuristic
         dist_a = torch.cdist(a_f, a_f).pow(2)
         dist_b = torch.cdist(b_f, b_f).pow(2)
 
@@ -79,12 +64,10 @@ def cka(a: torch.Tensor, b: torch.Tensor, kernel: str = "linear") -> float:
         ga = torch.exp(-dist_a / (2.0 * sig_a))
         gb = torch.exp(-dist_b / (2.0 * sig_b))
 
-    # Centering matrix H = I - (1/n) * 1 * 1^T
     h = torch.eye(n, device=a_f.device, dtype=torch.float32) - (1.0 / n)
     k_c = h @ ga @ h
     l_c = h @ gb @ h
 
-    # HSIC evaluations
     hsic_kl = (k_c * l_c).sum()
     hsic_kk = (k_c * k_c).sum()
     hsic_ll = (l_c * l_c).sum()
@@ -98,7 +81,6 @@ def cka(a: torch.Tensor, b: torch.Tensor, kernel: str = "linear") -> float:
     return float(torch.clamp(score, 0.0, 1.0).item())
 
 def neuron_overlap(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Computes mean row-wise cosine similarity across feature directions."""
     a_f, b_f = _safe_subsample(a, b, max_rows=2048)
 
     a_norm = F.normalize(a_f, p=2, dim=1, eps=1e-12)
@@ -113,7 +95,6 @@ def neuron_overlap(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(score.item())
 
 def sv_overlap(a: torch.Tensor, b: torch.Tensor, k: int = 64) -> float:
-    """Computes alignment of singular value spectrums using low-rank estimation."""
     try:
         a_f, b_f = _safe_subsample(a, b, max_rows=2048)
         min_dim = min(a_f.shape)
@@ -136,7 +117,6 @@ def sv_overlap(a: torch.Tensor, b: torch.Tensor, k: int = 64) -> float:
         return 0.0
 
 def similarity_bundle(a: torch.Tensor, b: torch.Tensor) -> Dict[str, float]:
-    """Generates a complete similarity metric profile for a parameter tensor pair."""
     return {
         "cosine": cosine_similarity_weights(a, b),
         "cka_linear": cka(a, b, "linear"),
@@ -146,7 +126,6 @@ def similarity_bundle(a: torch.Tensor, b: torch.Tensor) -> Dict[str, float]:
     }
 
 def aggregate_similarity(b: Dict[str, float]) -> float:
-    """Computes a robust weighted similarity index across metrics."""
     w = {
         "cosine": 0.35,
         "cka_linear": 0.25,
