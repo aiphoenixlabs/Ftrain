@@ -1,13 +1,12 @@
 
-from dataclasses import dataclass, field
-from typing import Dict, Any, Optional
-import re
 import math
+import re
 import torch
+from dataclasses import dataclass
+from typing import Dict, Any, Optional
 from .tensor_stats import compute_tensor_stats
 from .similarity import similarity_bundle, aggregate_similarity
 
-# Default Category Base Alpha Profiles
 CAT_ALPHA = {
     "embedding": 0.85,
     "lm_head": 0.15,
@@ -21,7 +20,6 @@ CAT_ALPHA = {
 }
 
 def classify_tensor(name: str) -> str:
-    """Classifies parameter keys into structural categories across all standard model architectures."""
     n = name.lower()
     if any(k in n for k in ("embed", "wte", "tok_embeddings")):
         return "embedding"
@@ -42,13 +40,11 @@ def classify_tensor(name: str) -> str:
     return "other"
 
 def extract_layer_depth(name: str, total_layers: int = 32) -> float:
-    """Extracts relative layer depth [0.0 - 1.0] from parameter key name."""
     match = re.search(r'(?:layers|h)\.(\d+)\.', name)
     if match:
         layer_idx = int(match.group(1))
         return min(1.0, max(0.0, layer_idx / max(1, total_layers - 1)))
     return 0.5
-
 
 @dataclass
 class TensorMergePlan:
@@ -63,21 +59,15 @@ class TensorMergePlan:
     importance_b: float = 0.5
     reason: str = ""
 
-
 class MergeAnalyzer:
-    """Computes multidimensional similarity & information-theoretic metrics for tensor pairs."""
-    
     def analyze_pair(self, name: str, a: torch.Tensor, b: torch.Tensor, total_layers: int = 32) -> Dict[str, Any]:
         sa = compute_tensor_stats(name, a)
         sb = compute_tensor_stats(name, b)
-        
         sim = 0.0
         if a.shape == b.shape and a.numel() > 0:
             sim = aggregate_similarity(similarity_bundle(a, b))
-
         layer_depth = extract_layer_depth(name, total_layers)
         category = classify_tensor(name)
-
         return {
             "a": sa,
             "b": sb,
@@ -86,10 +76,7 @@ class MergeAnalyzer:
             "layer_depth": layer_depth
         }
 
-
 class MergePlanner:
-    """Determines hyper-optimized merge strategies and blending ratios per tensor pair."""
-    
     def plan_for_pair(self, name: str, an: Dict[str, Any]) -> TensorMergePlan:
         cat = an["category"]
         sim = an["similarity"]
@@ -97,46 +84,35 @@ class MergePlanner:
         sa, sb = an["a"], an["b"]
         base_alpha = CAT_ALPHA.get(cat, 0.50)
 
-        # 1. Handle Dead / Zeroed Tensors
         if sa.dead and not sb.dead:
             return TensorMergePlan(name, cat, 0.0, "keep_b", "identity", sim, depth, 0.0, 1.0, "Model A tensor dead")
         if sb.dead and not sa.dead:
             return TensorMergePlan(name, cat, 1.0, "keep_a", "identity", sim, depth, 1.0, 0.0, "Model B tensor dead")
 
-        # 2. Critical Parameter Preservation (Norms & Routers)
         if cat in ("router", "norm"):
             return TensorMergePlan(name, cat, 1.0, "keep_a", "identity", sim, depth, 1.0, 0.0, "Preserving critical structure")
 
-        # 3. Calculate Relative Importance Score
         imp_a = max(sa.l2_norm * (0.5 + sa.effective_rank) * (1.0 + sa.entropy), 1e-6)
         imp_b = max(sb.l2_norm * (0.5 + sb.effective_rank) * (1.0 + sb.entropy), 1e-6)
         rel_imp_a = imp_a / (imp_a + imp_b)
 
-        # 4. Layer Depth-Aware Alpha Tuning
-        # Early layers (structural representation) favor Model A; Middle layers blend evenly; Late layers favor Model A
-        depth_modifier = 0.1 * math.cos(depth * math.pi * 2) if 'math' in globals() else 0.0
+        depth_modifier = 0.1 * math.cos(depth * math.pi * 2)
         
-        # 5. Compute Blended Dynamic Alpha
         sim_factor = base_alpha if sim > 0.90 else (0.5 * base_alpha + 0.25 if sim > 0.60 else 0.50)
         entropy_delta = sa.entropy - sb.entropy
         
         alpha = 0.40 * sim_factor + 0.35 * rel_imp_a + 0.15 * (0.5 + 0.5 * entropy_delta) + 0.10 * depth_modifier
         alpha = max(0.05, min(0.95, alpha))
 
-        # Variance/Std adjustment for Attention & FFN
         if sb.std > sa.std * 1.5 and cat in ("attention", "ffn"):
             alpha = max(0.10, alpha - 0.15)
 
-        # 6. Strategy Selection Matrix based on Geometric Similarity
         if sim < 0.20:
             return TensorMergePlan(name, cat, 1.0, "keep_a", "identity", sim, depth, rel_imp_a, 1.0 - rel_imp_a, "Orthogonal feature space")
-
         if sim > 0.85:
             return TensorMergePlan(name, cat, alpha, "weighted", "identity", sim, depth, rel_imp_a, 1.0 - rel_imp_a, "High alignment weighted blend")
-
         if sim > 0.55:
             return TensorMergePlan(name, cat, alpha, "slerp", "identity", sim, depth, rel_imp_a, 1.0 - rel_imp_a, "Spherical interpolation")
-
         if sa.shape == sb.shape and sa.numel >= 16:
             return TensorMergePlan(name, cat, alpha, "ties", "identity", sim, depth, rel_imp_a, 1.0 - rel_imp_a, "TIES sign-resolution merge")
 
