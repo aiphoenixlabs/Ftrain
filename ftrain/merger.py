@@ -1,5 +1,6 @@
 
 import os, sys, io, torch, math, re, gc
+import torch.nn.functional as F
 from functools import partial
 from unsloth import FastLanguageModel
 from . import ui
@@ -11,7 +12,7 @@ from .data_utils import load_data
 from .dataset import FtrainDataset, collate
 from torch.utils.data import DataLoader
 from .cpp_merge import fast_weighted_avg, fast_slerp, fast_ties, fast_fisher_merge
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 class Merger:
     def __init__(self, config):
@@ -30,13 +31,20 @@ class Merger:
                 self.captain = PhoenixCaptain(cap_cfg)
             except: pass
 
+    def _purge_memory(self):
+        """Helper to instantly reclaim VRAM and System RAM."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
     def _compute_loss(self, model, tokenizer, device) -> float:
         if not self.config.calibration_data: return float("inf")
         cal_data = load_data(self.config.calibration_data)[:10]
         ds = FtrainDataset(cal_data, tokenizer, 512)
         loader = DataLoader(ds, batch_size=2, collate_fn=partial(collate, pad_token_id=tokenizer.pad_token_id or 0))
         model.eval(); total, n = 0.0, 0
-        with torch.no_grad():
+        with torch.inference_mode():
             for b in loader:
                 out = model(input_ids=b["input_ids"].to(device), attention_mask=b["attention_mask"].to(device), labels=b["labels"].to(device))
                 if out.loss is not None:
@@ -44,148 +52,255 @@ class Merger:
                     n += 1
         return total / max(1, n)
 
+    # =========================================================================
+    # 🧠 CROSS-ARCHITECTURE ENGINE (Layer Mapping & Dimension Alignment)
+    # =========================================================================
+
+    def _get_num_layers(self, state_dict: Dict[str, torch.Tensor]) -> int:
+        """Extracts maximum layer index from state dict."""
+        layers = set()
+        for k in state_dict.keys():
+            match = re.search(r'(?:layers|h)\.(\d+)\.', k)
+            if match:
+                layers.add(int(match.group(1)))
+        return max(layers) + 1 if layers else 1
+
+    def _find_matching_key(self, key_a: str, keys_b: List[str], num_layers_a: int, num_layers_b: int) -> Optional[str]:
+        """Maps parameter names across different architecture families & scales layer indices."""
+        if key_a in keys_b:
+            return key_a
+
+        # Extract layer index if present
+        layer_match = re.search(r'(?:model\.layers|decoder\.layers|transformer\.h)\.(\d+)\.', key_a)
+        layer_a = int(layer_match.group(1)) if layer_match else None
+
+        # Calculate proportional layer index in Model B
+        layer_b = layer_a
+        if layer_a is not None and num_layers_a > 1 and num_layers_b > 1:
+            layer_b = int(round(layer_a * (num_layers_b - 1) / (num_layers_a - 1)))
+
+        # Normalize key naming across standard families (Llama, Qwen, Mistral, Gemma, DeepSeek)
+        norm_key = key_a
+        if layer_a is not None:
+            norm_key = re.sub(r'(?:model\.layers|decoder\.layers|transformer\.h)\.\d+\.', f'model.layers.{layer_b}.', key_a)
+
+        aliases = [
+            ('self_attn.q_proj', 'attention.wq'), ('self_attn.k_proj', 'attention.wk'),
+            ('self_attn.v_proj', 'attention.wv'), ('self_attn.o_proj', 'attention.wo'),
+            ('mlp.gate_proj', 'feed_forward.w1'), ('mlp.up_proj', 'feed_forward.w3'),
+            ('mlp.down_proj', 'feed_forward.w2'), ('input_layernorm', 'attention_norm'),
+            ('post_attention_layernorm', 'ffn_norm')
+        ]
+
+        candidates = [norm_key]
+        for src, target in aliases:
+            if src in norm_key: candidates.append(norm_key.replace(src, target))
+            elif target in norm_key: candidates.append(norm_key.replace(target, src))
+
+        for cand in candidates:
+            if cand in keys_b:
+                return cand
+        return None
+
+    def _align_tensor_shapes(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Interpolates and aligns Tensor B to match Tensor A's shape across non-matching dimensions."""
+        if a.shape == b.shape:
+            return b
+
+        b_work = b.to(dtype=torch.float32, device=a.device)
+        a_dim, b_dim = a.dim(), b.dim()
+
+        if a_dim == 1 and b_dim == 1:
+            # 1D Norms / Biases Alignment
+            b_reshaped = b_work.unsqueeze(0).unsqueeze(0)
+            b_aligned = F.interpolate(b_reshaped, size=(a.shape[0],), mode='linear', align_corners=False)
+            return b_aligned.squeeze(0).squeeze(0).to(a.dtype)
+
+        elif a_dim == 2 and b_dim == 2:
+            # 2D Weight Matrix Alignment (Bilinear Resampling)
+            b_reshaped = b_work.unsqueeze(0).unsqueeze(0)
+            b_aligned = F.interpolate(b_reshaped, size=(a.shape[0], a.shape[1]), mode='bilinear', align_corners=False)
+            return b_aligned.squeeze(0).squeeze(0).to(a.dtype)
+
+        else:
+            # High-Dim or Fallback Pad/Crop
+            out = torch.zeros_like(a, dtype=torch.float32, device=a.device)
+            slices = tuple(slice(0, min(sa, sb)) for sa, sb in zip(a.shape, b.shape))
+            out[slices] = b_work[slices]
+            return out.to(a.dtype)
+
+    # =========================================================================
+    # ⚡ MERGING WORKFLOW
+    # =========================================================================
+
     def merge(self) -> bool:
         ui.fire_header()
-        bar = ui.LoadingBar(message=f"Loading {self.model_a}"); bar.start()
-        model1, tok = FastLanguageModel.from_pretrained(self.model_a, load_in_4bit=False, dtype=torch.float32); bar.done()
-        
-        bar = ui.LoadingBar(message=f"Loading {self.model_b}"); bar.start()
-        model2, _ = FastLanguageModel.from_pretrained(self.model_b, load_in_4bit=False, dtype=torch.float32); bar.done()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        sd1, sd2 = model1.state_dict(), model2.state_dict()
-        
-        # ==========================================
-        # VRAM OPTIMIZATION 1: Delete model2 early!
-        # ==========================================
-        del model2
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        keys = list(sd1.keys()); total = len(keys); merged = {}
-
+        # ---------------------------------------------------------------------
+        # STEP 1: SEQUENTIAL FISHER COMPUTATION (Zero VRAM Waste)
+        # ---------------------------------------------------------------------
+        fisher_a, fisher_b = None, None
         cal_loader = None
+
         if self.config.calibration_data and (self.config.use_fisher or self.config.repair_steps > 0 or self.config.merge_knowledge_distill or self.config.hugging):
             cal_data = load_data(self.config.calibration_data)
-            cal_dataset = FtrainDataset(cal_data, tok, 512)
-            cal_loader = DataLoader(cal_dataset, batch_size=4, collate_fn=partial(collate, pad_token_id=tok.pad_token_id or 0))
+            # Temporary tokenizer loading
+            _, tok_temp = FastLanguageModel.from_pretrained(self.model_a, load_in_4bit=True)
+            cal_dataset = FtrainDataset(cal_data, tok_temp, 512)
+            cal_loader = DataLoader(cal_dataset, batch_size=2, collate_fn=partial(collate, pad_token_id=tok_temp.pad_token_id or 0))
+            del tok_temp; self._purge_memory()
 
-        if self.config.use_fisher:
-            compatible = all(k in sd2 and sd1[k].shape == sd2[k].shape for k in sd1)
-            if not compatible:
-                print("⚠️ Models have different architectures. Disabling Fisher merge automatically (Incompatible shapes).")
-                self.config.use_fisher = False
-
-        fisher_a = fisher_b = None
         if self.config.use_fisher and cal_loader:
-            print("🎣 Computing Fisher...")
-            fisher_a = compute_fisher(model1, cal_loader, torch.device("cuda"))
-            fisher_b = compute_fisher(model1, cal_loader, torch.device("cuda")) # Using model1 to avoid reloading model2
-            
-            if fisher_a is None or fisher_b is None:
-                print("⚠️ Falling back to Intelligent SLERP/Weighted merging without Fisher.")
-                self.config.use_fisher = False
+            print("🎣 Computing Fisher for Model A...")
+            m1_temp, _ = FastLanguageModel.from_pretrained(self.model_a, load_in_4bit=False, dtype=torch.float16)
+            fisher_a = compute_fisher(m1_temp, cal_loader, device)
+            del m1_temp; self._purge_memory()
 
+            print("🎣 Computing Fisher for Model B...")
+            m2_temp, _ = FastLanguageModel.from_pretrained(self.model_b, load_in_4bit=False, dtype=torch.float16)
+            fisher_b = compute_fisher(m2_temp, cal_loader, device)
+            del m2_temp; self._purge_memory()
+
+        # ---------------------------------------------------------------------
+        # STEP 2: LOAD MODELS & EXTRACT STATE DICTS TO CPU
+        # ---------------------------------------------------------------------
+        bar = ui.LoadingBar(message=f"Loading {self.model_a} (CPU State Dict)"); bar.start()
+        model1, tok = FastLanguageModel.from_pretrained(self.model_a, load_in_4bit=False, dtype=torch.float16)
+        sd1 = {k: v.cpu() for k, v in model1.state_dict().items()}
+        bar.done()
+
+        bar = ui.LoadingBar(message=f"Loading {self.model_b} (CPU State Dict)"); bar.start()
+        model2, _ = FastLanguageModel.from_pretrained(self.model_b, load_in_4bit=False, dtype=torch.float16)
+        sd2 = {k: v.cpu() for k, v in model2.state_dict().items()}
+        del model2; self._purge_memory()
+        bar.done()
+
+        num_layers_a = self._get_num_layers(sd1)
+        num_layers_b = self._get_num_layers(sd2)
+        keys_b = list(sd2.keys())
+
+        # Save baseline copy for safety check (low precision CPU)
+        sd1_baseline = {k: v.clone().to(torch.float16) for k, v in sd1.items()}
+
+        # ---------------------------------------------------------------------
+        # STEP 3: TENSOR-BY-TENSOR MERGING (In-place Mutation for Minimum Memory)
+        # ---------------------------------------------------------------------
         analyzer, planner = MergeAnalyzer(), MergePlanner()
-        stages = [(0,0.25,"Analyzing embeddings"), (0.25,0.5,"Merging attention"), (0.5,0.75,"Merging FFN"), (0.75,1.0,"Safety check")]
+        keys_a = list(sd1.keys())
+        total = len(keys_a)
+        stages = [(0, 0.25, "Analyzing embeddings"), (0.25, 0.5, "Merging attention"), (0.5, 0.75, "Merging FFN"), (0.75, 1.0, "Safety check")]
 
-        for i, k in enumerate(keys):
+        for i, k_a in enumerate(keys_a):
             progress = i / total; msg = ""
             for s, e, t in stages:
                 if s <= progress < e: msg = t; break
-            if i % max(1, total//20) == 0 or i == total-1: ui.print_merge_progress(i+1, total, message=msg)
+            if i % max(1, total // 20) == 0 or i == total - 1:
+                ui.print_merge_progress(i + 1, total, message=msg)
 
-            if k not in sd2 or sd1[k].shape != sd2[k].shape:
-                merged[k] = sd1[k]; continue
-            a, b = sd1[k], sd2[k]
+            k_b = self._find_matching_key(k_a, keys_b, num_layers_a, num_layers_b)
 
-            if self.strategy == "weighted": merged[k] = fast_weighted_avg(a, b, self.alpha)
-            elif self.strategy == "fisher" and self.config.use_fisher and fisher_a and k in fisher_a: 
-                merged[k] = fast_fisher_merge(a, b, fisher_a[k], fisher_b[k])
-            elif self.strategy == "slerp": merged[k] = fast_slerp(a, b, self.alpha)
-            elif self.strategy == "ties": merged[k] = fast_ties(a, b)
+            if not k_b:
+                continue # Retain sd1[k_a] as is
+
+            # Stream tensors to CUDA for fast compute
+            a = sd1[k_a].to(device, dtype=torch.float32)
+            b_raw = sd2.pop(k_b).to(device, dtype=torch.float32) # Pop to free RAM immediately
+            b = self._align_tensor_shapes(a, b_raw)
+            del b_raw
+
+            merged_tensor = None
+
+            if self.strategy == "weighted":
+                merged_tensor = fast_weighted_avg(a, b, self.alpha)
+            elif self.strategy == "fisher" and fisher_a and fisher_b and k_a in fisher_a and k_b in fisher_b:
+                fa = fisher_a[k_a].to(device)
+                fb = fisher_b[k_b].to(device)
+                merged_tensor = fast_fisher_merge(a, b, fa, fb)
+            elif self.strategy == "slerp":
+                merged_tensor = fast_slerp(a, b, self.alpha)
+            elif self.strategy == "ties":
+                merged_tensor = fast_ties(a, b)
             elif self.strategy == "intelligent":
-                analysis = analyzer.analyze_pair(k, a, b)
-                plan = planner.plan_for_pair(k, analysis)
+                analysis = analyzer.analyze_pair(k_a, a, b)
+                plan = planner.plan_for_pair(k_a, analysis)
+
                 if self.captain and i == 0:
                     cap_plan = self.captain.inspect_merge({"name": self.model_a}, {"name": self.model_b}, analysis)
-                    print(f"🧠 Captain merge plan: {cap_plan}")
-                    
-                    # ==========================================
-                    # VRAM OPTIMIZATION 2: Delete Captain LLM!
-                    # ==========================================
-                    del self.captain
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    print(f"\n🧠 Captain merge plan: {cap_plan}")
+                    del self.captain; self.captain = None; self._purge_memory()
 
-                if plan.strategy == "keep_a": merged[k] = a
-                elif plan.strategy == "keep_b": merged[k] = b
-                elif plan.strategy == "weighted": merged[k] = fast_weighted_avg(a, b, plan.alpha)
-                elif plan.strategy == "slerp": merged[k] = fast_slerp(a, b, plan.alpha)
-                elif plan.strategy == "ties": merged[k] = fast_ties(a, b)
+                if plan.strategy == "keep_a": merged_tensor = a
+                elif plan.strategy == "keep_b": merged_tensor = b
+                elif plan.strategy == "weighted": merged_tensor = fast_weighted_avg(a, b, plan.alpha)
+                elif plan.strategy == "slerp": merged_tensor = fast_slerp(a, b, plan.alpha)
+                elif plan.strategy == "ties": merged_tensor = fast_ties(a, b)
                 elif plan.strategy == "projection":
                     if a.dim() == 2:
                         from .projection import apply_projection
                         P = apply_projection(a, plan.projection, b)
-                        proj_a = (a.float() @ P).to(a.dtype)
-                        merged[k] = (plan.alpha * proj_a.float() + (1 - plan.alpha) * b.float()).to(a.dtype)
+                        proj_a = (a @ P)
+                        merged_tensor = (plan.alpha * proj_a + (1 - plan.alpha) * b)
                     else:
-                        merged[k] = (plan.alpha * a.float() + (1 - plan.alpha) * b.float()).to(a.dtype)
-                else: merged[k] = a
-            else: merged[k] = (self.alpha * a.float() + (1 - self.alpha) * b.float()).to(a.dtype)
+                        merged_tensor = (plan.alpha * a + (1 - plan.alpha) * b)
+                else:
+                    merged_tensor = a
+            else:
+                merged_tensor = (self.alpha * a + (1 - self.alpha) * b)
 
-        # ==========================================
-        # VRAM OPTIMIZATION 3: Delete sd2 BEFORE Safety Check!
-        # ==========================================
-        del sd2
-        gc.collect()
-        torch.cuda.empty_cache()
+            # Store result back into sd1 on CPU in target precision
+            sd1[k_a] = merged_tensor.to(dtype=self.dtype, device="cpu")
+            del a, b, merged_tensor
 
-        rep = check_state_dict(merged, baseline=sd1, norm_collapse_factor=0.1)
+        del sd2; self._purge_memory()
+
+        # ---------------------------------------------------------------------
+        # STEP 4: SAFETY CHECK & SANITIZATION
+        # ---------------------------------------------------------------------
+        rep = check_state_dict(sd1, baseline=sd1_baseline, norm_collapse_factor=0.1)
         print("\n" + rep.summary())
-        if not rep.ok: merged = sanitize(merged, sd1, norm_collapse_factor=0.1)
-        
-        # ==========================================
-        # VRAM OPTIMIZATION 4: Delete sd1 BEFORE loading merged weights!
-        # ==========================================
-        del sd1
-        gc.collect()
-        torch.cuda.empty_cache()
+        if not rep.ok:
+            sd1 = sanitize(sd1, sd1_baseline, norm_collapse_factor=0.1)
+        del sd1_baseline; self._purge_memory()
 
-        model1.load_state_dict(merged)
-        model1 = model1.to(self.dtype)
+        # Load merged weights into model1
+        model1.load_state_dict(sd1)
+        del sd1; self._purge_memory()
 
+        # ---------------------------------------------------------------------
+        # STEP 5: SAVE & OPTIONAL HUGGINGFACE PUSH
+        # ---------------------------------------------------------------------
         if self.config.name == "auto":
             a_name = self.model_a.split("/")[-1].replace("-", "_")
             b_name = self.model_b.split("/")[-1].replace("-", "_")
             repo_name = f"{a_name}_{b_name}_IntelMerge"
         else:
             repo_name = self.config.name
-            
+
         os.makedirs(self.output_dir, exist_ok=True)
         model1.save_pretrained(self.output_dir)
         tok.save_pretrained(self.output_dir)
-        
+
         hf_url = "None"
         if self.config.hugging and self.config.hugging_token:
             print("📊 Benchmarking models for HuggingFace push...")
-            device = torch.device("cuda")
             loss_merged = self._compute_loss(model1, tok, device)
-            
+
             try:
-                m_a, t_a = FastLanguageModel.from_pretrained(self.model_a, load_in_4bit=True, dtype=torch.float16)
+                m_a, t_a = FastLanguageModel.from_pretrained(self.model_a, load_in_4bit=True)
                 loss_a_orig = self._compute_loss(m_a, t_a, device)
-                del m_a, t_a; gc.collect(); torch.cuda.empty_cache()
+                del m_a, t_a; self._purge_memory()
             except: loss_a_orig = float('inf')
-            
+
             try:
-                m_b, t_b = FastLanguageModel.from_pretrained(self.model_b, load_in_4bit=True, dtype=torch.float16)
+                m_b, t_b = FastLanguageModel.from_pretrained(self.model_b, load_in_4bit=True)
                 loss_b_orig = self._compute_loss(m_b, t_b, device)
-                del m_b, t_b; gc.collect(); torch.cuda.empty_cache()
+                del m_b, t_b; self._purge_memory()
             except: loss_b_orig = float('inf')
 
             avg_orig = (loss_a_orig + loss_b_orig) / 2
             print(f"Loss A: {loss_a_orig:.4f} | Loss B: {loss_b_orig:.4f} | Avg: {avg_orig:.4f} | Merged: {loss_merged:.4f}")
-            
+
             if loss_merged < avg_orig:
                 print("✅ Merged model is smarter than average! Pushing to HuggingFace...")
                 from huggingface_hub import HfApi
