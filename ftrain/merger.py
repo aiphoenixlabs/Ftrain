@@ -170,7 +170,7 @@ class Merger:
             if not k_b: continue
 
             a = sd1[k_a].to(device, dtype=torch.float32)
-            b_raw = sd2.pop(k_b).to(device, dtype=torch.float32)
+            b_raw = sd2[k_b].to(device, dtype=torch.float32) # Removed .pop() to prevent KeyError on multi-layer mapping
             b = self._align_tensor_shapes(a, b_raw)
             del b_raw
 
