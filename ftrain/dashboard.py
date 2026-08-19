@@ -1,36 +1,46 @@
-```python id="f3pd24"
 """
 FTRAIN Live Training Dashboard
 ==============================
 
-Thread-safe lightweight monitoring dashboard for FTRAIN.
+Thread-safe, fault-tolerant live monitoring dashboard for FTRAIN.
 
-The dashboard is intentionally non-blocking from the training process:
+The dashboard is deliberately designed as a NON-CRITICAL subsystem:
+if Gradio is missing, an old Gradio API is installed, a refresh fails, or the
+dashboard cannot start, model training must continue normally.
 
-    training thread
-          │
-          ▼
-    log_metric(...)
-          │
-          ▼
-    thread-safe queue
-          │
-          ▼
-    Gradio dashboard thread
-          │
-          ▼
-    live loss / validation loss / learning-rate plots
+Architecture
+------------
+
+    FTRAIN training loop
+            │
+            │ log_metric(...)
+            ▼
+    bounded thread-safe queue
+            │
+            ▼
+    dashboard refresh callback
+            │
+            ▼
+    bounded metric history
+            │
+            ├── Training Loss
+            ├── Validation Loss
+            └── Learning Rate
 
 Design goals
 ------------
-• Never block model training on dashboard rendering.
-• Never let a dashboard failure terminate training.
-• Handle concurrent metric producers safely.
-• Bound memory growth for very long runs.
-• Gracefully deal with missing/older Gradio versions.
-• Reject malformed metrics without crashing.
-• Expose dashboard state for higher-level FTRAIN code.
-• Keep the existing public interface compatible.
+
+• Never block the training thread.
+• Never allow dashboard failures to crash training.
+• Thread-safe metric ingestion.
+• Bounded memory usage.
+• Safe handling of malformed/non-finite metrics.
+• Protection against out-of-order updates.
+• Protection against duplicate steps.
+• Graceful Gradio compatibility handling.
+• Graceful shutdown.
+• Runtime diagnostics through get_status().
+• Backward-compatible TrainingDashboard API.
 """
 
 from __future__ import annotations
@@ -40,7 +50,7 @@ import math
 import queue
 import threading
 from collections import deque
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Deque, Dict, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +58,28 @@ __all__ = ["TrainingDashboard"]
 
 
 # =============================================================================
-# Helpers
+# Constants
+# =============================================================================
+
+_DEFAULT_PORT = 7860
+_DEFAULT_MAX_POINTS = 10_000
+_DEFAULT_REFRESH_INTERVAL = 2.0
+_DEFAULT_QUEUE_SIZE = 2_000
+
+_MIN_PORT = 1
+_MAX_PORT = 65_535
+
+# Smallest useful refresh interval. Extremely small intervals can create
+# unnecessary Gradio/UI overhead and compete with training.
+_MIN_REFRESH_INTERVAL = 0.1
+
+# A metric is allowed to move forward by any amount, but never backward.
+# Duplicate steps are replaced rather than appended repeatedly.
+_EPSILON = 1e-12
+
+
+# =============================================================================
+# Helper functions
 # =============================================================================
 
 
@@ -56,10 +87,20 @@ def _finite_float(
     value: Any,
     default: float = float("nan"),
 ) -> float:
-    """Convert a value into a finite float, otherwise return default."""
+    """
+    Convert a value to float only when it is finite.
+
+    Parameters
+    ----------
+    value:
+        Value to convert.
+
+    default:
+        Value returned when conversion fails or the result is non-finite.
+    """
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
     if math.isfinite(result):
@@ -68,13 +109,27 @@ def _finite_float(
     return default
 
 
-def _safe_step(
-    value: Any,
-) -> Optional[int]:
-    """Normalize a training step."""
+def _safe_step(value: Any) -> Optional[int]:
+    """
+    Normalize a training step.
+
+    Rejects:
+        • None
+        • negative values
+        • non-numeric strings
+        • booleans
+
+    Returns
+    -------
+    Optional[int]
+        A valid non-negative integer step or None.
+    """
+    if isinstance(value, bool):
+        return None
+
     try:
         step = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
     if step < 0:
@@ -83,14 +138,82 @@ def _safe_step(
     return step
 
 
+def _safe_positive_int(
+    value: Any,
+    name: str,
+) -> int:
+    """Validate a positive integer configuration value."""
+    if isinstance(value, bool):
+        raise TypeError(
+            f"{name} must be an integer, not bool."
+        )
+
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TypeError(
+            f"{name} must be an integer, got {value!r}."
+        ) from exc
+
+    if result <= 0:
+        raise ValueError(
+            f"{name} must be greater than zero, got {result}."
+        )
+
+    return result
+
+
+def _safe_port(value: Any) -> int:
+    """Validate a TCP port."""
+    if isinstance(value, bool):
+        raise TypeError(
+            "port must be an integer, not bool."
+        )
+
+    try:
+        port = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TypeError(
+            f"port must be an integer, got {value!r}."
+        ) from exc
+
+    if not _MIN_PORT <= port <= _MAX_PORT:
+        raise ValueError(
+            f"port must be between {_MIN_PORT} and {_MAX_PORT}, "
+            f"got {port}."
+        )
+
+    return port
+
+
+def _safe_refresh_interval(value: Any) -> float:
+    """Validate the dashboard refresh interval."""
+    interval = _finite_float(
+        value,
+        default=float("nan"),
+    )
+
+    if not math.isfinite(interval):
+        raise ValueError(
+            f"refresh_interval must be a finite number, got {value!r}."
+        )
+
+    if interval < _MIN_REFRESH_INTERVAL:
+        raise ValueError(
+            f"refresh_interval must be >= {_MIN_REFRESH_INTERVAL} seconds."
+        )
+
+    return interval
+
+
 # =============================================================================
-# Dashboard
+# Training Dashboard
 # =============================================================================
 
 
 class TrainingDashboard:
     """
-    Live FTRAIN dashboard.
+    Live FTRAIN training dashboard.
 
     Parameters
     ----------
@@ -98,113 +221,94 @@ class TrainingDashboard:
         TCP port used by Gradio.
 
     max_points:
-        Maximum number of historical points retained in memory. This prevents
-        a multi-day training job from growing the Python process indefinitely.
+        Maximum number of historical metric points retained in memory.
 
     refresh_interval:
-        Dashboard refresh period in seconds.
+        Number of seconds between UI refreshes.
 
     queue_maxsize:
-        Maximum number of pending metric updates. When training produces data
-        faster than the UI can consume it, old queued metrics are coalesced
-        rather than allowing unbounded memory growth.
+        Maximum number of metrics waiting to be consumed.
+
+    Notes
+    -----
+    ``log_metric()`` is designed for use directly inside a training loop.
+    It never waits for the dashboard/UI and therefore should not meaningfully
+    affect training throughput.
     """
 
     def __init__(
         self,
-        port: int = 7860,
+        port: int = _DEFAULT_PORT,
         *,
-        max_points: int = 10_000,
-        refresh_interval: float = 2.0,
-        queue_maxsize: int = 2_000,
+        max_points: int = _DEFAULT_MAX_POINTS,
+        refresh_interval: float = _DEFAULT_REFRESH_INTERVAL,
+        queue_maxsize: int = _DEFAULT_QUEUE_SIZE,
     ) -> None:
-        if isinstance(port, bool):
-            raise TypeError("port must be an integer.")
-
-        try:
-            port = int(port)
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"port must be an integer, got {port!r}."
-            ) from exc
-
-        if not 1 <= port <= 65_535:
-            raise ValueError(
-                f"port must be between 1 and 65535, got {port}."
-            )
-
-        try:
-            max_points = int(max_points)
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"max_points must be an integer, got {max_points!r}."
-            ) from exc
-
-        if max_points <= 0:
-            raise ValueError(
-                "max_points must be greater than zero."
-            )
-
-        refresh_interval = _finite_float(
+        self.port = _safe_port(port)
+        self.max_points = _safe_positive_int(
+            max_points,
+            "max_points",
+        )
+        self.queue_maxsize = _safe_positive_int(
+            queue_maxsize,
+            "queue_maxsize",
+        )
+        self.refresh_interval = _safe_refresh_interval(
             refresh_interval,
-            default=2.0,
         )
 
-        if refresh_interval <= 0:
-            raise ValueError(
-                "refresh_interval must be greater than zero."
-            )
+        # ---------------------------------------------------------------------
+        # Metric queue
+        # ---------------------------------------------------------------------
 
-        try:
-            queue_maxsize = int(queue_maxsize)
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                "queue_maxsize must be an integer."
-            ) from exc
-
-        if queue_maxsize <= 0:
-            raise ValueError(
-                "queue_maxsize must be greater than zero."
-            )
-
-        self.port = port
-        self.max_points = max_points
-        self.refresh_interval = refresh_interval
-        self.queue_maxsize = queue_maxsize
-
-        # ``queue.Queue`` is thread-safe, unlike manipulating a normal list
-        # from multiple threads.
         self.queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(
-            maxsize=queue_maxsize
+            maxsize=self.queue_maxsize,
         )
 
-        # Bounded history prevents long training jobs from growing memory
-        # without limit.
-        self.history: Dict[str, deque] = {
-            "step": deque(maxlen=max_points),
-            "loss": deque(maxlen=max_points),
-            "lr": deque(maxlen=max_points),
-            "val_loss": deque(maxlen=max_points),
+        # ---------------------------------------------------------------------
+        # Bounded history
+        # ---------------------------------------------------------------------
+
+        self.history: Dict[str, Deque[Any]] = {
+            "step": deque(maxlen=self.max_points),
+            "loss": deque(maxlen=self.max_points),
+            "lr": deque(maxlen=self.max_points),
+            "val_loss": deque(maxlen=self.max_points),
         }
 
         self._history_lock = threading.RLock()
+        self._state_lock = threading.RLock()
 
-        # Dashboard lifecycle.
+        # ---------------------------------------------------------------------
+        # Lifecycle
+        # ---------------------------------------------------------------------
+
         self.running = False
         self.started = False
         self.failed = False
 
         self._stop_event = threading.Event()
-        self._state_lock = threading.RLock()
 
         self._demo: Any = None
         self._server_thread: Optional[threading.Thread] = None
+
         self._launch_error: Optional[BaseException] = None
 
-        self._last_step: Optional[int] = None
-        self._dropped_metrics = 0
-        self._received_metrics = 0
+        # ---------------------------------------------------------------------
+        # Runtime statistics
+        # ---------------------------------------------------------------------
 
+        self._last_step: Optional[int] = None
+        self._received_metrics = 0
+        self._accepted_metrics = 0
+        self._dropped_metrics = 0
+        self._invalid_metrics = 0
+        self._duplicate_metrics = 0
+        self._out_of_order_metrics = 0
+        self._refresh_count = 0
+        self._refresh_errors = 0
+
+        # The actual URL may become available only after Gradio launches.
         self.url: Optional[str] = None
 
     # =========================================================================
@@ -213,54 +317,66 @@ class TrainingDashboard:
 
     def start(self) -> bool:
         """
-        Start the Gradio dashboard.
+        Start the dashboard asynchronously.
 
         Returns
         -------
         bool
-            True when launch was successfully initiated, False when Gradio is
-            unavailable or launch failed.
+            True if the dashboard launch was initiated successfully.
 
-        Notes
-        -----
-        This method is safe to call repeatedly. Repeated calls do not start
-        multiple dashboard instances.
+        Important
+        ---------
+        A True return value means that startup was accepted, not necessarily
+        that the Gradio server is already listening. The actual state can be
+        inspected using ``get_status()``.
         """
         with self._state_lock:
+            # Already running.
             if self.running:
                 logger.debug(
                     "FTRAIN dashboard is already running."
                 )
                 return True
 
-            if self.started and not self.failed:
+            # A previous startup thread may still be alive.
+            if (
+                self._server_thread is not None
+                and self._server_thread.is_alive()
+            ):
+                logger.debug(
+                    "FTRAIN dashboard startup is already in progress."
+                )
                 return True
 
             self._stop_event.clear()
+
             self.failed = False
             self._launch_error = None
+            self.url = None
 
+        # Import Gradio lazily.
+        #
+        # This is important because importing FTRAIN itself should not require
+        # a GUI dependency.
         try:
             import gradio as gr
-        except ImportError:
+        except ImportError as exc:
             with self._state_lock:
-                self.failed = True
+                self.running = False
                 self.started = False
-                self._launch_error = ImportError(
-                    "Gradio is not installed."
-                )
+                self.failed = True
+                self._launch_error = exc
 
             logger.warning(
-                "FTRAIN dashboard disabled: Gradio is not installed."
+                "FTRAIN dashboard unavailable because Gradio is not installed."
             )
+
             return False
 
+        # Mark startup as initiated.
         with self._state_lock:
-            self.running = True
             self.started = True
 
-        # Launch directly in a daemon thread so training never blocks on
-        # Gradio's server startup or event loop.
         self._server_thread = threading.Thread(
             target=self._launch,
             args=(gr,),
@@ -270,18 +386,26 @@ class TrainingDashboard:
 
         self._server_thread.start()
 
+        logger.info(
+            "FTRAIN dashboard startup initiated on port %d.",
+            self.port,
+        )
+
         return True
 
-    def _launch(
-        self,
-        gr: Any,
-    ) -> None:
+    def _launch(self, gr: Any) -> None:
         """
-        Build and launch the Gradio application.
+        Construct and launch the Gradio application.
 
-        Any server failure is isolated from the training thread.
+        This method runs outside the training thread.
         """
+        demo = None
+
         try:
+            # -----------------------------------------------------------------
+            # Build UI
+            # -----------------------------------------------------------------
+
             with gr.Blocks(
                 title="FTRAIN Live Dashboard",
                 theme=gr.themes.Monochrome(),
@@ -290,7 +414,10 @@ class TrainingDashboard:
                     """
 # 🔥 FTRAIN Live Dashboard
 
-Real-time training telemetry from the FTRAIN engine.
+### Real-time training telemetry
+
+Monitor training loss, validation loss, and learning rate while FTRAIN
+is running.
 """
                 )
 
@@ -313,13 +440,11 @@ Real-time training telemetry from the FTRAIN engine.
                     x="step",
                     y="lr",
                     title="Learning Rate",
-                    height=260,
+                    height=280,
                 )
 
-                # Small status display is useful when debugging whether the
-                # dashboard is receiving fresh telemetry.
                 status = gr.Markdown(
-                    self._status_text()
+                    self._status_text(),
                 )
 
                 outputs = [
@@ -329,63 +454,208 @@ Real-time training telemetry from the FTRAIN engine.
                     status,
                 ]
 
-                # Newer Gradio versions expose ``every`` differently from
-                # older versions, so support both patterns conservatively.
-                try:
-                    demo.load(
-                        self._fetch_dashboard,
-                        outputs=outputs,
-                        every=self.refresh_interval,
-                    )
-                except TypeError:
-                    # Older versions may not accept ``every`` on load.
-                    demo.load(
-                        self._fetch_dashboard,
-                        outputs=outputs,
-                    )
+                # -------------------------------------------------------------
+                # Refresh callback
+                # -------------------------------------------------------------
 
-                self._demo = demo
+                self._register_refresh(
+                    demo=demo,
+                    outputs=outputs,
+                )
 
-                launch_kwargs: Dict[str, Any] = {
-                    "server_port": self.port,
-                    "share": False,
-                    "prevent_thread_lock": True,
-                    "quiet": True,
-                }
+            self._demo = demo
 
-                # ``show_error`` is not supported by every Gradio version.
-                try:
-                    demo.launch(
-                        **launch_kwargs,
-                        show_error=True,
-                    )
-                except TypeError:
-                    demo.launch(
-                        **launch_kwargs,
-                    )
+            # If stop() was called while the UI was being constructed, do not
+            # launch a server that the caller already asked us to stop.
+            if self._stop_event.is_set():
+                logger.debug(
+                    "FTRAIN dashboard launch cancelled before Gradio startup."
+                )
+                return
+
+            # -----------------------------------------------------------------
+            # Launch Gradio
+            # -----------------------------------------------------------------
+
+            launch_kwargs: Dict[str, Any] = {
+                "server_port": self.port,
+                "share": False,
+                "prevent_thread_lock": True,
+                "quiet": True,
+            }
+
+            launch_result = self._launch_gradio(
+                demo,
+                launch_kwargs,
+            )
+
+            # -------------------------------------------------------------
+            # Extract server URL where possible.
+            # -------------------------------------------------------------
+
+            self._extract_url(
+                launch_result,
+                demo,
+            )
+
+            with self._state_lock:
+                # Do not resurrect a dashboard that was stopped while launch
+                # was happening.
+                if self._stop_event.is_set():
+                    self.running = False
+                else:
+                    self.running = True
+                    self.failed = False
 
             logger.info(
-                "FTRAIN dashboard launched on port %d.",
+                "FTRAIN dashboard launched on port %d%s.",
                 self.port,
+                f" ({self.url})" if self.url else "",
             )
 
         except Exception as exc:
             with self._state_lock:
-                self.failed = True
                 self.running = False
+                self.failed = True
                 self._launch_error = exc
 
             logger.exception(
                 "FTRAIN dashboard failed to launch."
             )
 
-    def stop(self) -> None:
+    def _register_refresh(
+        self,
+        demo: Any,
+        outputs: list,
+    ) -> None:
         """
-        Request dashboard shutdown.
+        Register the periodic dashboard refresh.
 
-        Gradio's server lifecycle differs between versions. We therefore
-        attempt a supported close method when available, but never raise a
-        dashboard shutdown exception into the training loop.
+        Gradio APIs have changed across releases, so this method deliberately
+        tries the modern form first and falls back to older behavior.
+        """
+        try:
+            demo.load(
+                self._fetch_dashboard,
+                inputs=None,
+                outputs=outputs,
+                every=self.refresh_interval,
+            )
+            return
+
+        except TypeError:
+            pass
+
+        # Older Gradio versions may not accept ``every`` on load.
+        #
+        # We still register the callback so the dashboard can display initial
+        # data. This is preferable to making dashboard startup fatal.
+        try:
+            demo.load(
+                self._fetch_dashboard,
+                inputs=None,
+                outputs=outputs,
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to register FTRAIN dashboard refresh callback."
+            )
+            raise
+
+    def _launch_gradio(
+        self,
+        demo: Any,
+        launch_kwargs: Dict[str, Any],
+    ) -> Any:
+        """
+        Launch Gradio with compatibility fallbacks.
+        """
+        try:
+            return demo.launch(
+                **launch_kwargs,
+                show_error=True,
+            )
+
+        except TypeError:
+            # ``show_error`` is unavailable in some Gradio versions.
+            return demo.launch(
+                **launch_kwargs,
+            )
+
+    def _extract_url(
+        self,
+        launch_result: Any,
+        demo: Any,
+    ) -> None:
+        """
+        Attempt to discover the local Gradio URL.
+
+        This is intentionally best-effort because Gradio's return type differs
+        across releases.
+        """
+        candidates = []
+
+        if launch_result is not None:
+            candidates.extend(
+                [
+                    getattr(
+                        launch_result,
+                        "local_url",
+                        None,
+                    ),
+                    getattr(
+                        launch_result,
+                        "local_url",
+                        None,
+                    ),
+                ]
+            )
+
+            if isinstance(
+                launch_result,
+                tuple,
+            ):
+                candidates.extend(
+                    launch_result
+                )
+
+        candidates.extend(
+            [
+                getattr(
+                    demo,
+                    "local_url",
+                    None,
+                ),
+            ]
+        )
+
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                self.url = candidate.strip()
+                return
+
+    def stop(
+        self,
+        *,
+        wait: bool = False,
+        timeout: float = 5.0,
+    ) -> None:
+        """
+        Stop the dashboard.
+
+        Parameters
+        ----------
+        wait:
+            Whether to wait for the dashboard thread to terminate.
+
+        timeout:
+            Maximum amount of time to wait when ``wait=True``.
+
+        Notes
+        -----
+        Shutdown errors are intentionally swallowed so that calling
+        ``dashboard.stop()`` can never break the training process.
         """
         with self._state_lock:
             self.running = False
@@ -410,12 +680,49 @@ Real-time training telemetry from the FTRAIN engine.
                     exc_info=True,
                 )
 
+        thread = self._server_thread
+
+        if (
+            wait
+            and thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            try:
+                thread.join(
+                    timeout=max(
+                        0.0,
+                        float(timeout),
+                    )
+                )
+            except Exception:
+                logger.debug(
+                    "FTRAIN dashboard thread join failed.",
+                    exc_info=True,
+                )
+
         logger.info(
             "FTRAIN dashboard stopped."
         )
 
+    def __enter__(self) -> "TrainingDashboard":
+        """Allow ``with TrainingDashboard(...)`` usage."""
+        self.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Any,
+        exc_value: Any,
+        traceback: Any,
+    ) -> None:
+        """Stop dashboard when leaving a context manager."""
+        self.stop(
+            wait=False,
+        )
+
     # =========================================================================
-    # Metrics
+    # Metric ingestion
     # =========================================================================
 
     def log_metric(
@@ -426,27 +733,57 @@ Real-time training telemetry from the FTRAIN engine.
         val_loss: Any = None,
     ) -> bool:
         """
-        Queue one training metric.
+        Queue one training metric without blocking.
+
+        Parameters
+        ----------
+        step:
+            Current global training step.
+
+        loss:
+            Training loss.
+
+        lr:
+            Current learning rate.
+
+        val_loss:
+            Optional validation loss.
 
         Returns
         -------
         bool
-            True if the metric was accepted, False if it was rejected or the
-            dashboard is not active.
+            True when accepted into the dashboard queue.
+            False when rejected or the dashboard is inactive.
+
+        Important
+        ---------
+        This function intentionally does NOT wait for free queue space.
+        Training speed should never depend on dashboard speed.
         """
         with self._state_lock:
-            if not self.running:
+            if not self.started:
                 return False
 
+            # During a launch race, metrics are still useful. They can be
+            # queued before Gradio finishes starting.
+            if self.failed:
+                return False
+
+            self._received_metrics += 1
+
         normalized_step = _safe_step(
-            step
+            step,
         )
 
         if normalized_step is None:
+            with self._state_lock:
+                self._invalid_metrics += 1
+
             logger.debug(
-                "FTRAIN dashboard ignored invalid step=%r.",
+                "FTRAIN dashboard rejected invalid step=%r.",
                 step,
             )
+
             return False
 
         metric = {
@@ -460,78 +797,100 @@ Real-time training telemetry from the FTRAIN engine.
             ),
         }
 
-        # We don't want every weird NaN to disappear silently, but we also
-        # don't want one bad metric to crash the training thread.
-        if not math.isfinite(metric["loss"]):
-            logger.debug(
-                "FTRAIN dashboard received non-finite loss at step %d.",
-                normalized_step,
-            )
-
-        if not math.isfinite(metric["lr"]):
-            logger.debug(
-                "FTRAIN dashboard received non-finite LR at step %d.",
-                normalized_step,
-            )
-
-        with self._state_lock:
-            self._received_metrics += 1
+        # ---------------------------------------------------------------------
+        # Queue without blocking
+        # ---------------------------------------------------------------------
 
         try:
             self.queue.put_nowait(
-                metric
+                metric,
             )
+
+            with self._state_lock:
+                self._accepted_metrics += 1
 
             return True
 
         except queue.Full:
-            # The UI can fall behind significantly during high-throughput
-            # training. Drop the oldest item and preserve the newest one.
+            pass
+
+        # ---------------------------------------------------------------------
+        # Queue is full.
+        #
+        # Preserve the newest metric because it represents the most current
+        # state of the model.
+        # ---------------------------------------------------------------------
+
+        try:
+            oldest = self.queue.get_nowait()
+
             try:
-                self.queue.get_nowait()
-            except queue.Empty:
+                self.queue.task_done()
+            except ValueError:
+                # Defensive protection against unusual Queue implementations.
                 pass
 
-            try:
-                self.queue.put_nowait(
-                    metric
-                )
-                with self._state_lock:
-                    self._dropped_metrics += 1
+            del oldest
 
-                return True
+        except queue.Empty:
+            pass
 
-            except queue.Full:
-                with self._state_lock:
-                    self._dropped_metrics += 1
+        try:
+            self.queue.put_nowait(
+                metric,
+            )
 
-                return False
+            with self._state_lock:
+                self._accepted_metrics += 1
+                self._dropped_metrics += 1
+
+            return True
+
+        except queue.Full:
+            with self._state_lock:
+                self._dropped_metrics += 1
+
+            return False
 
     # =========================================================================
-    # Data processing
+    # Queue / history processing
     # =========================================================================
 
     def _drain_queue(self) -> int:
         """
-        Consume all currently queued metrics.
+        Drain all currently available metrics.
 
-        Important:
-        Never use ``queue.empty()`` as a synchronization primitive. A consumer
-        can observe empty=True while another thread is just about to enqueue.
+        Uses ``get_nowait()`` instead of ``queue.empty()`` because ``empty()``
+        is not safe as a concurrency decision.
         """
         drained = 0
 
         while True:
             try:
                 metric = self.queue.get_nowait()
+
             except queue.Empty:
                 break
 
-            self._append_metric(
-                metric
-            )
+            try:
+                self._append_metric(
+                    metric,
+                )
 
-            self.queue.task_done()
+            except Exception:
+                logger.exception(
+                    "Failed to process FTRAIN dashboard metric."
+                )
+
+            finally:
+                try:
+                    self.queue.task_done()
+                except ValueError:
+                    logger.debug(
+                        "Dashboard queue task_done() mismatch.",
+                        exc_info=True,
+                    )
+
             drained += 1
 
         return drained
@@ -540,81 +899,119 @@ Real-time training telemetry from the FTRAIN engine.
         self,
         metric: Mapping[str, Any],
     ) -> None:
-        """Validate and append one metric to bounded history."""
+        """
+        Validate and append a metric.
+
+        Duplicate steps replace the latest stored value instead of creating
+        duplicate x-axis points.
+
+        Older/out-of-order steps are ignored.
+        """
         step = _safe_step(
-            metric.get("step")
+            metric.get("step"),
         )
 
         if step is None:
+            with self._state_lock:
+                self._invalid_metrics += 1
+
             return
 
         loss = _finite_float(
-            metric.get("loss")
+            metric.get("loss"),
         )
 
         lr = _finite_float(
-            metric.get("lr")
+            metric.get("lr"),
         )
 
         val_loss = _finite_float(
-            metric.get("val_loss")
+            metric.get("val_loss"),
         )
 
         with self._history_lock:
-            # Ignore older/out-of-order updates. This prevents an asynchronous
-            # producer from drawing the graph backward.
+            # -------------------------------------------------------------
+            # Out-of-order metric
+            # -------------------------------------------------------------
+
             if (
                 self._last_step is not None
                 and step < self._last_step
             ):
+                with self._state_lock:
+                    self._out_of_order_metrics += 1
+
                 logger.debug(
                     "Ignoring out-of-order dashboard metric: "
-                    "step=%d < last=%d.",
+                    "step=%d < latest=%d.",
                     step,
                     self._last_step,
                 )
+
                 return
 
+            # -------------------------------------------------------------
+            # Duplicate step
+            # -------------------------------------------------------------
+
+            if (
+                self._last_step is not None
+                and step == self._last_step
+                and self.history["step"]
+            ):
+                self.history["loss"][-1] = loss
+                self.history["lr"][-1] = lr
+                self.history["val_loss"][-1] = val_loss
+
+                with self._state_lock:
+                    self._duplicate_metrics += 1
+
+                return
+
+            # -------------------------------------------------------------
+            # New step
+            # -------------------------------------------------------------
+
             self.history["step"].append(
-                step
+                step,
             )
 
             self.history["loss"].append(
-                loss
+                loss,
             )
 
             self.history["lr"].append(
-                lr
+                lr,
             )
 
             self.history["val_loss"].append(
-                val_loss
+                val_loss,
             )
 
             self._last_step = step
 
     def _build_dataframe(self):
         """
-        Build a pandas DataFrame from a consistent snapshot.
+        Build a pandas DataFrame from a consistent history snapshot.
 
-        Pandas is imported lazily so importing FTRAIN does not require pandas
-        unless dashboard functionality is actually used.
+        Pandas is imported lazily so that simply importing FTRAIN does not
+        require dashboard dependencies.
         """
         import pandas as pd
 
         with self._history_lock:
             data = {
                 "step": list(
-                    self.history["step"]
+                    self.history["step"],
                 ),
                 "loss": list(
-                    self.history["loss"]
+                    self.history["loss"],
                 ),
                 "lr": list(
-                    self.history["lr"]
+                    self.history["lr"],
                 ),
                 "val_loss": list(
-                    self.history["val_loss"]
+                    self.history["val_loss"],
                 ),
             }
 
@@ -629,24 +1026,29 @@ Real-time training telemetry from the FTRAIN engine.
             )
 
         return pd.DataFrame(
-            data
+            data,
         )
 
     # =========================================================================
-    # Gradio callbacks
+    # Gradio refresh callbacks
     # =========================================================================
 
-    def _fetch_dashboard(self):
+    def _fetch_dashboard(
+        self,
+    ) -> Tuple[Any, Any, Any, str]:
         """
-        Return fresh plot data plus dashboard status.
+        Process pending metrics and return all dashboard outputs.
 
-        This method is intentionally defensive because it runs from Gradio's
-        event/update thread rather than the training loop.
+        The same DataFrame is intentionally reused for the three LinePlots.
+        Gradio selects the appropriate x/y columns for each component.
         """
         try:
             self._drain_queue()
 
             dataframe = self._build_dataframe()
+
+            with self._state_lock:
+                self._refresh_count += 1
 
             return (
                 dataframe,
@@ -656,40 +1058,73 @@ Real-time training telemetry from the FTRAIN engine.
             )
 
         except Exception as exc:
+            with self._state_lock:
+                self._refresh_errors += 1
+
             logger.exception(
                 "FTRAIN dashboard refresh failed."
             )
 
+            # Try to provide a valid UI response even after an internal
+            # refresh failure.
+            try:
+                dataframe = self._build_dataframe()
+            except Exception:
+                import pandas as pd
+
+                dataframe = pd.DataFrame(
+                    {
+                        "step": [0],
+                        "loss": [float("nan")],
+                        "lr": [float("nan")],
+                        "val_loss": [float("nan")],
+                    }
+                )
+
             return (
-                self._build_dataframe(),
-                self._build_dataframe(),
-                self._build_dataframe(),
+                dataframe,
+                dataframe,
+                dataframe,
                 f"⚠️ Dashboard refresh error: `{exc}`",
             )
 
-    # Backward-compatible private alias matching the old implementation.
+    # Backward-compatible alias for older internal FTRAIN code.
     def _fetch(self):
         return self._fetch_dashboard()
 
     # =========================================================================
-    # Status / introspection
+    # Status
     # =========================================================================
 
     def _status_text(self) -> str:
-        """Build a compact dashboard state message."""
+        """
+        Generate the human-readable dashboard status panel.
+        """
         with self._state_lock:
             running = self.running
+            started = self.started
             failed = self.failed
+
             received = self._received_metrics
+            accepted = self._accepted_metrics
             dropped = self._dropped_metrics
+            invalid = self._invalid_metrics
+            duplicate = self._duplicate_metrics
+            out_of_order = self._out_of_order_metrics
+            refreshes = self._refresh_count
+            refresh_errors = self._refresh_errors
+
             last_step = self._last_step
+            error = self._launch_error
 
         if failed:
-            state = "🔴 failed"
+            state = "🔴 **FAILED**"
         elif running:
-            state = "🟢 running"
+            state = "🟢 **RUNNING**"
+        elif started:
+            state = "🟡 **STARTING / STOPPING**"
         else:
-            state = "⚪ stopped"
+            state = "⚪ **STOPPED**"
 
         step_text = (
             "N/A"
@@ -697,55 +1132,169 @@ Real-time training telemetry from the FTRAIN engine.
             else str(last_step)
         )
 
+        error_text = ""
+
+        if error is not None:
+            error_text = (
+                f"\n\n**Last error:** `{error}`"
+            )
+
         return (
-            f"**Status:** {state}  \n"
-            f"**Latest step:** {step_text}  \n"
-            f"**Metrics received:** {received}  \n"
-            f"**Metrics dropped:** {dropped}"
+            f"**Dashboard:** {state}  \n"
+            f"**Latest step:** `{step_text}`  \n"
+            f"**Metrics received:** `{received}`  \n"
+            f"**Metrics accepted:** `{accepted}`  \n"
+            f"**Metrics dropped:** `{dropped}`  \n"
+            f"**Invalid metrics:** `{invalid}`  \n"
+            f"**Duplicate steps:** `{duplicate}`  \n"
+            f"**Out-of-order:** `{out_of_order}`  \n"
+            f"**Refreshes:** `{refreshes}`  \n"
+            f"**Refresh errors:** `{refresh_errors}`"
+            f"{error_text}"
         )
 
     def get_status(self) -> Dict[str, Any]:
         """
-        Return structured dashboard status for diagnostics/tests.
+        Return structured runtime diagnostics.
+
+        Useful for:
+            • tests
+            • CLI diagnostics
+            • FTRAIN core
+            • debugging dashboard startup
         """
         with self._state_lock:
-            return {
-                "running": self.running,
-                "started": self.started,
-                "failed": self.failed,
-                "port": self.port,
-                "url": self.url,
-                "received_metrics": self._received_metrics,
-                "dropped_metrics": self._dropped_metrics,
-                "last_step": self._last_step,
-                "queued_metrics": self.queue.qsize(),
-                "history_points": len(
-                    self.history["step"]
-                ),
-                "error": (
-                    str(self._launch_error)
-                    if self._launch_error is not None
-                    else None
-                ),
-            }
+            running = self.running
+            started = self.started
+            failed = self.failed
+
+            received = self._received_metrics
+            accepted = self._accepted_metrics
+            dropped = self._dropped_metrics
+            invalid = self._invalid_metrics
+            duplicate = self._duplicate_metrics
+            out_of_order = self._out_of_order_metrics
+            refresh_count = self._refresh_count
+            refresh_errors = self._refresh_errors
+
+            last_step = self._last_step
+            error = self._launch_error
+
+        with self._history_lock:
+            history_points = len(
+                self.history["step"]
+            )
+
+        server_thread = self._server_thread
+
+        return {
+            "running": running,
+            "started": started,
+            "failed": failed,
+            "port": self.port,
+            "url": self.url,
+            "received_metrics": received,
+            "accepted_metrics": accepted,
+            "dropped_metrics": dropped,
+            "invalid_metrics": invalid,
+            "duplicate_metrics": duplicate,
+            "out_of_order_metrics": out_of_order,
+            "refresh_count": refresh_count,
+            "refresh_errors": refresh_errors,
+            "last_step": last_step,
+            "queued_metrics": self.queue.qsize(),
+            "history_points": history_points,
+            "max_points": self.max_points,
+            "queue_maxsize": self.queue_maxsize,
+            "refresh_interval": self.refresh_interval,
+            "server_thread_alive": (
+                server_thread.is_alive()
+                if server_thread is not None
+                else False
+            ),
+            "error": (
+                str(error)
+                if error is not None
+                else None
+            ),
+        }
+
+    # =========================================================================
+    # History management
+    # =========================================================================
 
     def clear_history(self) -> None:
-        """Clear stored metric history without stopping the dashboard."""
+        """
+        Clear all stored metrics and pending queue data.
+
+        The dashboard itself remains running.
+        """
         with self._history_lock:
             for values in self.history.values():
                 values.clear()
 
             self._last_step = None
 
-        # Also discard stale queued metrics.
         while True:
             try:
                 self.queue.get_nowait()
-                self.queue.task_done()
+
             except queue.Empty:
                 break
+
+            else:
+                try:
+                    self.queue.task_done()
+                except ValueError:
+                    pass
 
         logger.debug(
             "FTRAIN dashboard history cleared."
         )
-```
+
+    # =========================================================================
+    # Convenience properties
+    # =========================================================================
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the dashboard is currently considered running."""
+        with self._state_lock:
+            return self.running
+
+    @property
+    def is_healthy(self) -> bool:
+        """
+        Whether the dashboard is running without a recorded startup failure.
+        """
+        with self._state_lock:
+            return self.running and not self.failed
+
+    @property
+    def latest_step(self) -> Optional[int]:
+        """Return the latest processed training step."""
+        with self._state_lock:
+            return self._last_step
+
+    @property
+    def pending_metrics(self) -> int:
+        """Return the number of metrics currently waiting in the queue."""
+        return self.queue.qsize()
+
+    # =========================================================================
+    # Cleanup
+    # =========================================================================
+
+    def __del__(self) -> None:
+        """
+        Best-effort cleanup.
+
+        Destructors should never raise, especially for an optional dashboard
+        subsystem.
+        """
+        try:
+            self.stop(
+                wait=False,
+            )
+        except Exception:
+            pass
