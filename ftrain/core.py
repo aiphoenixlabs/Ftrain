@@ -1588,38 +1588,28 @@ class Ftrain:
 
         return result
 
-    def _select_evaluation_example(
+        def _select_evaluation_example(
         self,
     ) -> Tuple[str, str]:
         """Select one useful conversational example for before/after testing."""
         if not self.train_data:
             return "", ""
 
-        # Try several random samples rather than failing because the first
-        # sample does not have a conversational structure.
         try:
             length = len(self.train_data)
         except TypeError:
             return "", ""
 
-        indices = list(
-            range(length)
-        )
-
+        indices = list(range(length))
         random.shuffle(indices)
 
-        for index in indices[
-            : min(20, length)
-        ]:
+        for index in indices[:min(20, length)]:
             sample = self.train_data[index]
 
             if not isinstance(sample, Mapping):
                 continue
 
-            messages = sample.get(
-                "messages",
-                [],
-            )
+            messages = sample.get("messages", [])
 
             if not isinstance(messages, Sequence):
                 continue
@@ -1629,41 +1619,23 @@ class Ftrain:
 
             user_message = messages[0]
 
-            if not isinstance(
-                user_message,
-                Mapping,
-            ):
+            if not isinstance(user_message, Mapping):
                 continue
 
-            prompt = _safe_text(
-                user_message.get(
-                    "content",
-                    "",
-                )
-            )
-
-            correct = _safe_text(
-                messages[1].get(
-                    "content",
-                    "",
-                )
-                if isinstance(
-                    messages[1],
-                    Mapping,
-                )
-                else ""
-            )
+            # FIX: Use str() instead of the missing _safe_text()
+            prompt = str(user_message.get("content", "")).strip()
+            
+            correct_msg = messages[1] if isinstance(messages[1], Mapping) else {}
+            correct = str(correct_msg.get("content", "")).strip()
 
             if not prompt or not correct:
                 continue
 
             try:
-                rendered = (
-                    self.tokenizer.apply_chat_template(
-                        [user_message],
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
+                rendered = self.tokenizer.apply_chat_template(
+                    [user_message],
+                    tokenize=False,
+                    add_generation_prompt=True,
                 )
             except Exception:
                 rendered = prompt
