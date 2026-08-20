@@ -1592,8 +1592,8 @@ class Ftrain:
         self,
     ) -> Tuple[str, str]:
       
-        if not self.train_data:
-            return "", ""
+            if not self.train_data:
+                return "", ""
 
         try:
             length = len(self.train_data)
