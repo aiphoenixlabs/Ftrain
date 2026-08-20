@@ -1591,7 +1591,7 @@ class Ftrain:
         def _select_evaluation_example(
         self,
     ) -> Tuple[str, str]:
-        """Select one useful conversational example for before/after testing."""
+      
         if not self.train_data:
             return "", ""
 
