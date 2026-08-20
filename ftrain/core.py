@@ -4,44 +4,36 @@ FTRAIN Core Training Engine
 
 Production-oriented training orchestration for FTRAIN.
 
-This module coordinates:
+This version focuses on correctness first, then performance, resilience,
+and adaptive training intelligence.
 
-    Model loading
-        ↓
-    Dataset preparation
-        ↓
-    PEFT / LoRA / DoRA
-        ↓
-    Optimizer
-        ↓
-    Scheduler
-        ↓
-    Hugging Face / Unsloth / Custom training
-        ↓
-    Captain monitoring
-        ↓
-    Evaluation
-        ↓
-    Checkpointing
-        ↓
-    Final model export
+Backends
+--------
+- Unsloth Trainer (preferred when available)
+- Hugging Face Trainer fallback
+- Native FTRAIN custom loop
+- GRPO through TRL/Unsloth
 
-Important design principles
----------------------------
-• Never silently lose gradients.
-• Never assume CUDA exists.
-• Never use model/dataset truthiness when ``is not None`` is required.
-• Keep checkpoint state separate from model weights.
-• Make resume behavior deterministic.
-• Avoid duplicate adaptive-LR logic.
-• Keep optional integrations optional.
-• Restore training mode after evaluation.
-• Avoid swallowing unexpected exceptions.
+Key guarantees
+--------------
+- No missing evaluation method / unreachable method definitions.
+- Safe CPU/CUDA/MPS behavior.
+- Explicit train/eval mode restoration.
+- Stable gradient accumulation, including adaptive accumulation.
+- Grouped optimizer parameter groups instead of one optimizer group per tensor.
+- Captain advice is represented without creating competing LR controllers.
+- Version-tolerant Trainer construction using runtime signature inspection.
+- Real runtime metrics and checkpoint state.
+- Deterministic validation and evaluation where possible.
+- Optional automatic LoRA target discovery.
+- Safer mixed precision and finite-loss/gradient handling.
+- Clean final model export under ``output_dir/final``.
 """
 
 from __future__ import annotations
 
 import io
+import inspect
 import json
 import logging
 import math
@@ -52,40 +44,30 @@ import shutil
 import sys
 import threading
 from contextlib import contextmanager
-from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 
+try:
+    from transformers import TrainerCallback
+except Exception:  # pragma: no cover - transformers is optional until training
+    TrainerCallback = object
+
 from unsloth import FastLanguageModel
 
 from . import ui
 from .captain import PhoenixCaptain
 from .config import TrainConfig
-from .data_quality import (
-    balance_datasets,
-    deduplicate,
-    filter_by_perplexity,
-)
+from .data_quality import balance_datasets, deduplicate, filter_by_perplexity
 from .dataset import FtrainDataset, LengthSampler, collate
 from .families import get_preset
 from .lora import inject as inject_lora
 from .lora_dora import inject_dora
-from .model_utils import (
-    count_params,
-    get_family,
-    get_num_layers,
-    is_moe,
-    seed_everything,
-)
+from .model_utils import count_params, get_family, get_num_layers, is_moe, seed_everything
 from .speed import flash_mode
-from .train_optim import (
-    LRFinder,
-    adaptive_accumulation,
-    cosine_restart_scheduler,
-)
+from .train_optim import adaptive_accumulation, cosine_restart_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +91,6 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         result = float(value)
     except (TypeError, ValueError):
         return default
-
     return result if math.isfinite(result) else default
 
 
@@ -132,18 +113,17 @@ def _is_empty(value: Any) -> bool:
     return size == 0 if size is not None else False
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, _safe_float(value, low)))
+
+
 # =============================================================================
 # Core engine
 # =============================================================================
 
 
 class Ftrain:
-    """
-    Main FTRAIN training engine.
-
-    The object is intentionally stateful because training requires persistent
-    optimizer, scheduler, checkpoint and Captain state.
-    """
+    """Main FTRAIN training engine."""
 
     def __init__(
         self,
@@ -158,20 +138,15 @@ class Ftrain:
         self.train_data = train_data
         self.val_data = val_data
 
-        # ---------------------------------------------------------------------
-        # Runtime state
-        # ---------------------------------------------------------------------
-
         self.loss_history: List[float] = []
+        self.val_loss_history: List[float] = []
+        self.lr_history: List[float] = []
 
-        self.step: int = 0
-        self.epoch: int = 0
-
+        self.step = 0
+        self.epoch = 0
         self._last_loss: Optional[float] = None
         self._last_val_loss: Optional[float] = None
-
-        self._captain_mult: float = 1.0
-
+        self._captain_mult = 1.0
         self._captain_layer_boosts: Dict[str, float] = {
             "early": 1.0,
             "late": 1.0,
@@ -181,145 +156,74 @@ class Ftrain:
         }
 
         self.device = self._resolve_device()
-
         self.model: Optional[torch.nn.Module] = None
         self.tokenizer: Any = None
-
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.scheduler: Any = None
-
+        self._hf_trainer: Any = None
+        self._hf_scheduler: Any = None
+        self._hf_optimizer: Optional[torch.optim.Optimizer] = None
         self.train_dataset: Any = None
         self.val_dataset: Any = None
-
         self.dashboard: Any = None
         self.captain: Optional[PhoenixCaptain] = None
-
-        self.total_steps: int = int(config.max_steps)
-
+        self.total_steps = max(1, int(config.max_steps))
         self._checkpoint_lock = threading.Lock()
         self._dashboard_started = False
-
-        # Number of gradient accumulation units currently active.
-        self._current_accumulation_steps = max(
-            1,
-            int(config.gradient_accumulation_steps),
-        )
-
-        # ---------------------------------------------------------------------
-        # Environment initialization
-        # ---------------------------------------------------------------------
+        self._current_accumulation_steps = max(1, int(config.gradient_accumulation_steps))
+        self._accumulation_target = self._current_accumulation_steps
+        self._best_val_loss: Optional[float] = None
+        self._bad_eval_count = 0
+        self._skipped_steps = 0
 
         self._configure_runtime()
-
-        # ---------------------------------------------------------------------
-        # Resume discovery
-        # ---------------------------------------------------------------------
-
         self._resolve_auto_resume()
 
-        # ---------------------------------------------------------------------
-        # Model family / preset
-        # ---------------------------------------------------------------------
-
-        self.family = (
-            config.family
-            if config.family != "auto"
-            else get_family(config.model_name)
-        )
-
+        self.family = config.family if config.family != "auto" else get_family(config.model_name)
         self.preset = get_preset(self.family) or {}
 
-        if (
-            not getattr(config, "lora_target_modules", None)
-            and self.preset.get("lora_targets")
-        ):
-            config.lora_target_modules = list(
-                self.preset["lora_targets"]
-            )
-
-        # ---------------------------------------------------------------------
-        # Load model
-        # ---------------------------------------------------------------------
+        if not getattr(config, "lora_target_modules", None) and self.preset.get("lora_targets"):
+            config.lora_target_modules = list(self.preset["lora_targets"])
 
         self._load_model()
 
-        # ---------------------------------------------------------------------
-        # Captain
-        # ---------------------------------------------------------------------
-
         if config.captain_enabled:
-            self.captain = PhoenixCaptain(config)
-            self.captain.set_family_context(
-                self.family,
-                is_moe(self.model),
-            )
-            self.captain.analyze_model(self.model)
-
-        # ---------------------------------------------------------------------
-        # Dataset quality pipeline
-        # ---------------------------------------------------------------------
+            try:
+                self.captain = PhoenixCaptain(config)
+                self.captain.set_family_context(self.family, is_moe(self.model))
+                self.captain.analyze_model(self.model)
+            except Exception:
+                logger.warning("FTRAIN: Captain initialization failed; continuing without Captain.", exc_info=True)
+                self.captain = None
 
         self._prepare_data()
-
-        # ---------------------------------------------------------------------
-        # Optional automatic LoRA target discovery
-        # ---------------------------------------------------------------------
 
         if config.auto_lora_targets:
             self._discover_lora_targets()
 
-        # ---------------------------------------------------------------------
-        # PEFT
-        # ---------------------------------------------------------------------
-
         self._apply_adapters()
-
         self._print_parameter_summary()
-
-        # ---------------------------------------------------------------------
-        # Trainer datasets
-        # ---------------------------------------------------------------------
-
         self._build_datasets()
-
-        # ---------------------------------------------------------------------
-        # Dashboard
-        # ---------------------------------------------------------------------
-
         self._start_dashboard()
 
-        Path(config.output_dir).expanduser().mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        Path(config.output_dir).expanduser().mkdir(parents=True, exist_ok=True)
 
     # =========================================================================
     # Environment
     # =========================================================================
 
     def _resolve_device(self) -> torch.device:
-        """Select the safest available training device."""
         if torch.cuda.is_available():
             return torch.device("cuda")
-
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
-
         return torch.device("cpu")
 
     def _configure_runtime(self) -> None:
-        """Configure kernels, reproducibility and optional GRPO integration."""
         try:
-            flash_mode(
-                enabled=True,
-                tf32=self.device.type == "cuda",
-            )
+            flash_mode(enabled=True, tf32=self.device.type == "cuda")
         except Exception:
-            logger.warning(
-                "FTRAIN: optimized kernel configuration failed; "
-                "continuing with defaults.",
-                exc_info=True,
-            )
+            logger.debug("FTRAIN: optimized kernel configuration unavailable.", exc_info=True)
 
         seed_everything(self.config.seed)
 
@@ -328,106 +232,81 @@ class Ftrain:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
             except Exception:
-                logger.debug(
-                    "FTRAIN: TF32 configuration unavailable.",
-                    exc_info=True,
-                )
+                logger.debug("FTRAIN: TF32 configuration unavailable.", exc_info=True)
 
         if self.config.use_grpo:
             try:
                 from unsloth import PatchFastRL
-
-                PatchFastRL(
-                    "GRPO",
-                    FastLanguageModel,
-                )
-
-                logger.info(
-                    "🧠 Unsloth patched for GRPO."
-                )
-
+                PatchFastRL("GRPO", FastLanguageModel)
+                logger.info("FTRAIN: Unsloth GRPO patch enabled.")
             except Exception:
-                # GRPO import/setup can legitimately vary by installed
-                # Unsloth/TRL version. The actual GRPO path will surface a
-                # precise failure if it cannot run.
-                logger.warning(
-                    "FTRAIN: GRPO patching was unavailable.",
-                    exc_info=True,
-                )
+                logger.warning("FTRAIN: GRPO patching unavailable.", exc_info=True)
 
     # =========================================================================
-    # Resume handling
+    # Resume
     # =========================================================================
 
     def _resolve_auto_resume(self) -> None:
-        """Find the newest valid checkpoint for automatic resume."""
-        cfg = self.config
-
-        if not cfg.auto_resume:
+        """Find the newest compatible FTRAIN/HF-style checkpoint."""
+        if not self.config.auto_resume:
             return
 
-        checkpoint_root = (
-            Path(cfg.output_dir).expanduser()
-            / "checkpoints"
-        )
-
-        if not checkpoint_root.is_dir():
-            return
+        roots = [
+            Path(self.config.output_dir).expanduser() / "checkpoints",
+            Path(self.config.output_dir).expanduser(),
+        ]
 
         candidates: List[Tuple[int, Path]] = []
+        seen: set[str] = set()
 
-        for entry in checkpoint_root.iterdir():
-            if not entry.is_dir():
+        for root in roots:
+            if not root.is_dir():
                 continue
 
-            match = re.fullmatch(
-                r"step_(\d+)",
-                entry.name,
-            )
-
-            if not match:
+            try:
+                entries = list(root.iterdir())
+            except OSError:
                 continue
 
-            step = int(match.group(1))
+            for entry in entries:
+                if not entry.is_dir():
+                    continue
 
-            # A checkpoint is considered resumable only if it contains model
-            # state. Older FTRAIN versions may not have optimizer state; those
-            # are still usable as model-only resumes.
-            model_marker = (
-                entry / "config.json"
+                name = entry.name
+                match = re.fullmatch(r"(?:step_|checkpoint-)(\d+)", name)
+                if not match:
+                    continue
+
+                step = int(match.group(1))
+                resolved = str(entry.resolve())
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+
+                has_model = (
+                    (entry / "config.json").exists()
+                    or (entry / "adapter_config.json").exists()
+                    or (entry / "model.safetensors").exists()
+                    or (entry / "pytorch_model.bin").exists()
+                    or any(entry.glob("*.safetensors"))
+                )
+
+                # HF/Trainer checkpoints may contain only sharded model files
+                # and trainer_state.json; accept those as valid resumable state.
+                has_trainer_state = (entry / "trainer_state.json").exists()
+
+                if has_model or has_trainer_state:
+                    candidates.append((step, entry))
+
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            step, checkpoint = candidates[-1]
+            self.config.resume_from_checkpoint = str(checkpoint)
+            logger.info(
+                "FTRAIN: auto-resume selected %s (step %d).",
+                checkpoint,
+                step,
             )
-
-            if (
-                (entry / "adapter_config.json").exists()
-                or model_marker.exists()
-                or (entry / "pytorch_model.bin").exists()
-                or (entry / "model.safetensors").exists()
-                or any(
-                    entry.glob("*.safetensors")
-                )
-            ):
-                candidates.append(
-                    (step, entry)
-                )
-
-        if not candidates:
-            return
-
-        candidates.sort(
-            key=lambda item: item[0]
-        )
-
-        step, checkpoint = candidates[-1]
-
-        cfg.resume_from_checkpoint = str(
-            checkpoint
-        )
-
-        logger.info(
-            "🔄 Auto-resume selected checkpoint %s (step %d).",
-            checkpoint,
-            step,
-        )
 
     # =========================================================================
     # Model loading
@@ -435,247 +314,126 @@ class Ftrain:
 
     @contextmanager
     def _quiet_stdout(self):
-        """
-        Temporarily capture noisy model-loader stdout.
-
-        stderr is deliberately left untouched so low-level CUDA/model-loading
-        failures remain visible.
-        """
         previous = sys.stdout
         buffer = io.StringIO()
-
         try:
             sys.stdout = buffer
             yield buffer
         finally:
             sys.stdout = previous
 
+    def _preferred_model_dtype(self) -> torch.dtype:
+        if self.device.type == "cuda":
+            return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.float32
+
     def _load_model(self) -> None:
-        """Load model/tokenizer with Unsloth-first, Transformers fallback."""
         cfg = self.config
-
-        bar = ui.LoadingBar(
-            message=f"Loading {cfg.model_name}",
-            real_progress=cfg.show_model_progress,
-        )
-
+        bar = ui.LoadingBar(message=f"Loading {cfg.model_name}", real_progress=cfg.show_model_progress)
         bar.start()
-
         try:
             kwargs: Dict[str, Any] = {
                 "model_name": cfg.model_name,
                 "max_seq_length": cfg.max_seq_length,
                 "load_in_4bit": cfg.load_in_4bit,
             }
-
             if not cfg.load_in_4bit:
                 kwargs["dtype"] = self._preferred_model_dtype()
 
-            attention_impl = self.preset.get(
-                "attn_implementation"
-            )
-
+            attention_impl = self.preset.get("attn_implementation")
             if attention_impl:
                 kwargs["attn_implementation"] = attention_impl
 
-            logger.info(
-                "Loading model through Unsloth: %s",
-                cfg.model_name,
-            )
-
             try:
                 with self._quiet_stdout():
-                    self.model, self.tokenizer = (
-                        FastLanguageModel.from_pretrained(
-                            **kwargs
-                        )
-                    )
-
+                    self.model, self.tokenizer = FastLanguageModel.from_pretrained(**kwargs)
             except Exception as unsloth_error:
-                logger.warning(
-                    "⚠️ Unsloth model loading failed: %s",
-                    unsloth_error,
-                )
-
+                logger.warning("FTRAIN: Unsloth loader failed: %s", unsloth_error)
                 self._load_model_transformers()
 
             if self.model is None or self.tokenizer is None:
-                raise RuntimeError(
-                    "Model loading completed without both model and tokenizer."
-                )
+                raise RuntimeError("Model loading did not produce both model and tokenizer.")
 
             self._prepare_tokenizer()
             self._prepare_model()
-
         finally:
             bar.done()
 
-    def _preferred_model_dtype(self) -> torch.dtype:
-        """Choose a dtype supported by the current device."""
-        if self.device.type == "cuda":
-            if (
-                torch.cuda.is_bf16_supported()
-            ):
-                return torch.bfloat16
-
-            return torch.float16
-
-        if self.device.type == "cpu":
-            return torch.float32
-
-        # MPS has broad fp16 support but fp32 is the safest default when
-        # loading through the generic Transformers path.
-        return torch.float32
-
     def _load_model_transformers(self) -> None:
-        """Fallback Hugging Face Transformers model loader."""
-        from transformers import (
-            AutoModelForCausalLM,
-            AutoTokenizer,
-        )
-
-        cfg = self.config
-
-        dtype = self._preferred_model_dtype()
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         kwargs: Dict[str, Any] = {
-            "torch_dtype": dtype,
+            "torch_dtype": self._preferred_model_dtype(),
         }
-
-        # Avoid forcing device_map="auto" for CPU/MPS.
         if self.device.type == "cuda":
             kwargs["device_map"] = "auto"
 
-        logger.info(
-            "Loading model through Transformers fallback: %s",
-            cfg.model_name,
-        )
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name,
-            **kwargs,
-        )
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model_name
-        )
+        self.model = AutoModelForCausalLM.from_pretrained(self.config.model_name, **kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
 
     def _prepare_tokenizer(self) -> None:
-        """Ensure tokenizer has a usable padding token."""
-        tokenizer = self.tokenizer
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer was not loaded.")
 
-        if tokenizer is None:
-            raise RuntimeError(
-                "Tokenizer was not loaded."
-            )
-
-        if getattr(
-            tokenizer,
-            "pad_token_id",
-            None,
-        ) is None:
-            eos_token = getattr(
-                tokenizer,
-                "eos_token",
-                None,
-            )
-
-            if eos_token is not None:
-                tokenizer.pad_token = eos_token
+        if getattr(self.tokenizer, "pad_token_id", None) is None:
+            eos = getattr(self.tokenizer, "eos_token", None)
+            if eos is not None:
+                self.tokenizer.pad_token = eos
             else:
-                logger.warning(
-                    "Tokenizer has no pad or EOS token."
-                )
+                logger.warning("Tokenizer has neither pad_token nor eos_token.")
 
         try:
-            tokenizer.padding_side = "right"
+            self.tokenizer.padding_side = "right"
         except Exception:
             pass
 
     def _prepare_model(self) -> None:
-        """Move/prepare the model when appropriate."""
         if self.model is None:
-            raise RuntimeError(
-                "Model is unavailable."
-            )
+            raise RuntimeError("Model is unavailable.")
 
-        # device_map="auto" models are already dispatched and should not be
-        # moved wholesale.
-        if self.device.type in {"cuda", "cpu", "mps"}:
+        try:
+            has_device_map = bool(getattr(self.model, "hf_device_map", None))
+            if not has_device_map:
+                self.model.to(self.device)
+        except Exception:
+            logger.debug("FTRAIN: model device preparation skipped.", exc_info=True)
+
+        if self.config.gradient_checkpointing_enable:
             try:
-                has_device_map = bool(
-                    getattr(
-                        self.model,
-                        "hf_device_map",
-                        None,
-                    )
-                )
-
-                if not has_device_map:
-                    self.model.to(self.device)
+                if hasattr(self.model, "gradient_checkpointing_enable"):
+                    self.model.gradient_checkpointing_enable()
             except Exception:
-                logger.debug(
-                    "FTRAIN: model device preparation was skipped.",
-                    exc_info=True,
-                )
+                logger.warning("FTRAIN: gradient checkpointing could not be enabled.", exc_info=True)
 
     # =========================================================================
-    # Dataset preparation
+    # Dataset processing
     # =========================================================================
 
     def _prepare_data(self) -> None:
-        """Run configured dataset-quality transformations."""
         cfg = self.config
-
         if self.train_data is None:
-            raise ValueError(
-                "Training data cannot be None."
-            )
+            raise ValueError("Training data cannot be None.")
 
         train_len = _safe_len(self.train_data)
-
         if train_len == 0:
-            raise ValueError(
-                "Training dataset is empty."
-            )
+            raise ValueError("Training dataset is empty.")
 
-        needs_processing = (
-            cfg.data_perplexity_filter
-            or cfg.data_dedup
-            or bool(cfg.data_sources)
-        )
-
+        needs_processing = bool(cfg.data_perplexity_filter or cfg.data_dedup or cfg.data_sources)
         if not needs_processing:
             return
 
         original_length = train_len
         changes: List[str] = []
 
-        # ---------------------------------------------------------------
-        # Deduplication
-        # ---------------------------------------------------------------
-
         if cfg.data_dedup:
             before = _safe_len(self.train_data) or 0
-
-            self.train_data = deduplicate(
-                self.train_data
-            )
-
+            self.train_data = deduplicate(self.train_data)
             after = _safe_len(self.train_data) or 0
-
             if after < before:
-                changes.append(
-                    f"Deduplication removed {before - after} duplicates."
-                )
-
-        # ---------------------------------------------------------------
-        # Perplexity filtering
-        # ---------------------------------------------------------------
+                changes.append(f"Deduplication removed {before - after} duplicates.")
 
         if cfg.data_perplexity_filter:
             before = _safe_len(self.train_data) or 0
-
             self.train_data = filter_by_perplexity(
                 self.train_data,
                 self.model,
@@ -683,135 +441,59 @@ class Ftrain:
                 self.device,
                 cfg.data_perplexity_keep_pct,
             )
-
             after = _safe_len(self.train_data) or 0
-
             if after < before:
-                changes.append(
-                    f"Perplexity filter removed "
-                    f"{before - after} samples."
-                )
-
-        # ---------------------------------------------------------------
-        # Additional data sources
-        # ---------------------------------------------------------------
+                changes.append(f"Perplexity filter removed {before - after} samples.")
 
         if cfg.data_sources:
             from .data_utils import load_data
-
             datasets = [self.train_data]
-
             for source in cfg.data_sources:
-                try:
-                    datasets.append(
-                        load_data(source)
-                    )
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Failed to load additional data source "
-                        f"{source!r}."
-                    ) from exc
+                datasets.append(load_data(source))
+            self.train_data = balance_datasets(datasets, cfg.data_balance_strategy)
+            changes.append("Balanced multiple data sources.")
 
-            self.train_data = balance_datasets(
-                datasets,
-                cfg.data_balance_strategy,
-            )
-
-            changes.append(
-                "Balanced multiple data sources."
-            )
-
-        final_length = _safe_len(
-            self.train_data
-        ) or 0
-
+        final_length = _safe_len(self.train_data) or 0
         if final_length == 0:
-            raise ValueError(
-                "Dataset processing removed all training samples."
-            )
+            raise ValueError("Dataset processing removed all training samples.")
 
-        if self.captain:
-            self.captain.analyze_and_report_data(
-                original_length,
-                final_length,
-                changes,
-            )
+        if self.captain is not None:
+            try:
+                self.captain.analyze_and_report_data(original_length, final_length, changes)
+            except Exception:
+                logger.debug("FTRAIN: Captain data report failed.", exc_info=True)
 
     # =========================================================================
-    # Automatic LoRA target discovery
+    # LoRA target discovery
     # =========================================================================
 
     def _discover_lora_targets(self) -> None:
-        """
-        Discover useful LoRA targets from actual gradient activity.
-
-        The old implementation cleared ``p.grad`` before collecting it,
-        making the resulting gradient map empty. This implementation reads
-        gradient norms first and clears gradients only afterward.
-        """
-        if self.model is None:
-            raise RuntimeError(
-                "Cannot discover LoRA targets without a model."
-            )
-
-        if self.tokenizer is None:
-            raise RuntimeError(
-                "Cannot discover LoRA targets without a tokenizer."
-            )
-
-        logger.info(
-            "🔍 Automatically discovering LoRA target modules..."
-        )
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("LoRA target discovery requires model and tokenizer.")
 
         self.model.train()
         self._clear_gradients()
-
-        encoded = self.tokenizer(
-            "Test",
-            return_tensors="pt",
-        )
-
-        encoded = {
-            key: value.to(self.device)
-            if isinstance(value, torch.Tensor)
-            else value
-            for key, value in encoded.items()
-        }
+        encoded = self.tokenizer("Test", return_tensors="pt")
+        encoded = self._move_to_device(encoded)
 
         try:
             with self._autocast_context():
-                output = self.model(
-                    **encoded,
-                    labels=encoded["input_ids"],
-                )
-
-            loss = output.loss
-
-            if loss is None:
-                raise RuntimeError(
-                    "Model returned no loss during LoRA target discovery."
-                )
+                output = self.model(**encoded, labels=encoded["input_ids"])
+            loss = getattr(output, "loss", None)
+            if loss is None or not torch.isfinite(loss):
+                return
 
             loss.backward()
-
-            gradient_scores: Dict[str, float] = {}
+            scores: Dict[str, float] = {}
 
             for name, parameter in self.model.named_parameters():
-                if parameter.grad is None:
+                if not parameter.requires_grad or parameter.grad is None:
+                    continue
+                lname = name.lower()
+                if "lora_" in lname or "dora" in lname or "magnitude" in lname:
                     continue
 
-                if not parameter.requires_grad:
-                    continue
-
-                # Remove adapter parameters from discovery; target selection
-                # should be based on the base model's actual trainable signal.
-                if "lora_" in name.lower():
-                    continue
-
-                module_name = self._extract_target_module_name(
-                    name
-                )
-
+                module_name = self._extract_target_module_name(name)
                 if not module_name:
                     continue
 
@@ -819,179 +501,87 @@ class Ftrain:
                     score = parameter.grad.detach().float().norm().item()
                 except Exception:
                     continue
-
                 if not math.isfinite(score):
                     continue
+                scores[module_name] = scores.get(module_name, 0.0) + score
 
-                gradient_scores[module_name] = (
-                    gradient_scores.get(module_name, 0.0)
-                    + score
-                )
-
-            if not gradient_scores:
-                logger.warning(
-                    "Automatic LoRA discovery found no usable gradient "
-                    "signals. Keeping configured/preset targets."
-                )
-                return
-
-            target_count = max(
-                1,
-                int(self.config.lora_target_count),
-            )
-
-            ranked = sorted(
-                gradient_scores.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )
-
-            selected = [
-                name
-                for name, _ in ranked[:target_count]
-            ]
-
-            if selected:
-                self.config.lora_target_modules = selected
-
-                logger.info(
-                    "🎯 Auto-selected LoRA targets: %s",
-                    ", ".join(selected),
-                )
-
+            if scores:
+                target_count = max(1, int(self.config.lora_target_count))
+                ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                selected = [name for name, _ in ranked[:target_count]]
+                if selected:
+                    self.config.lora_target_modules = selected
+                    logger.info("FTRAIN: auto LoRA targets: %s", ", ".join(selected))
         finally:
             self._clear_gradients()
 
     @staticmethod
-    def _extract_target_module_name(
-        parameter_name: str,
-    ) -> Optional[str]:
-        """
-        Extract the module component immediately preceding a parameter name.
-
-        Examples:
-            self_attn.q_proj.weight -> q_proj
-            mlp.gate_proj.weight    -> gate_proj
-        """
+    def _extract_target_module_name(parameter_name: str) -> Optional[str]:
         parts = parameter_name.split(".")
-
         if len(parts) < 2:
             return None
-
         candidate = parts[-2]
-
         if candidate.isdigit():
             return None
-
         return candidate
 
     # =========================================================================
-    # Adapter injection
+    # Adapter setup
     # =========================================================================
 
     def _apply_adapters(self) -> None:
-        """Inject LoRA/DoRA adapters according to configuration."""
         cfg = self.config
-
         if self.model is None:
-            raise RuntimeError(
-                "Cannot apply adapters without a model."
-            )
+            raise RuntimeError("Cannot apply adapters without a model.")
 
-        targets = (
-            list(cfg.lora_target_modules)
-            if cfg.lora_target_modules
-            else None
-        )
-
+        targets = list(cfg.lora_target_modules) if cfg.lora_target_modules else None
         if not targets:
             raise ValueError(
-                "No LoRA target modules are configured. "
-                "Provide lora_target_modules, enable auto_lora_targets, "
-                "or ensure the selected model family provides defaults."
+                "No LoRA target modules are configured. Provide lora_target_modules, "
+                "enable auto_lora_targets, or use a model family with presets."
             )
-
-        if cfg.use_dora and cfg.use_unsloth_lora:
-            self.model = FastLanguageModel.get_peft_model(
-                self.model,
-                r=cfg.lora_r,
-                lora_alpha=cfg.lora_alpha,
-                target_modules=targets,
-                use_dora=True,
-            )
-
-        elif cfg.use_unsloth_lora:
-            self.model = FastLanguageModel.get_peft_model(
-                self.model,
-                r=cfg.lora_r,
-                lora_alpha=cfg.lora_alpha,
-                target_modules=targets,
-            )
-
-        elif cfg.use_custom_lora:
-            if cfg.use_dora:
-                self.model = inject_dora(
-                    self.model,
-                    targets,
-                    cfg.lora_r,
-                    cfg.lora_alpha,
-                )
-            else:
-                self.model = inject_lora(
-                    self.model,
-                    targets,
-                    cfg.lora_r,
-                    cfg.lora_alpha,
-                )
-
-        else:
-            logger.info(
-                "No adapter backend enabled; training full model "
-                "parameters where supported."
-            )
-
-    def _print_parameter_summary(self) -> None:
-        """Log trainable/total parameter statistics."""
-        if self.model is None:
-            return
 
         try:
+            if cfg.use_unsloth_lora:
+                kwargs = {
+                    "r": cfg.lora_r,
+                    "lora_alpha": cfg.lora_alpha,
+                    "target_modules": targets,
+                }
+                if cfg.use_dora:
+                    kwargs["use_dora"] = True
+                self.model = FastLanguageModel.get_peft_model(self.model, **kwargs)
+            elif cfg.use_custom_lora:
+                if cfg.use_dora:
+                    self.model = inject_dora(self.model, targets, cfg.lora_r, cfg.lora_alpha)
+                else:
+                    self.model = inject_lora(self.model, targets, cfg.lora_r, cfg.lora_alpha)
+            else:
+                logger.info("FTRAIN: adapter backend disabled; full-parameter training selected.")
+        except Exception as exc:
+            raise RuntimeError(f"Adapter initialization failed: {exc}") from exc
+
+    def _print_parameter_summary(self) -> None:
+        if self.model is None:
+            return
+        try:
             stats = count_params(self.model)
-
-            total = _safe_float(
-                stats.get("total", 0)
-            )
-
-            trainable = _safe_float(
-                stats.get("trainable", 0)
-            )
-
-            logger.info(
-                "Trainable parameters: %.2fM / %.2fM",
-                trainable / 1e6,
-                total / 1e6,
-            )
-
+            total = _safe_float(stats.get("total", 0))
+            trainable = _safe_float(stats.get("trainable", 0))
+            percent = 100.0 * trainable / max(total, 1.0)
             print(
-                f"Trainable params: "
-                f"{trainable / 1e6:.2f}M / "
-                f"{total / 1e6:.2f}M"
+                f"Trainable params: {trainable / 1e6:.2f}M / "
+                f"{total / 1e6:.2f}M ({percent:.2f}%)"
             )
-
         except Exception:
-            logger.warning(
-                "Unable to compute parameter statistics.",
-                exc_info=True,
-            )
+            logger.warning("FTRAIN: parameter summary failed.", exc_info=True)
 
     # =========================================================================
-    # Dataset wrappers
+    # Dataset wrappers / dashboard
     # =========================================================================
 
     def _build_datasets(self) -> None:
-        """Build FTRAIN dataset wrappers for the selected backend."""
         cfg = self.config
-
         if cfg.use_grpo:
             self.train_dataset = self.train_data
         else:
@@ -1002,10 +592,7 @@ class Ftrain:
                 cfg.use_packing,
             )
 
-        if (
-            self.val_data is not None
-            and not _is_empty(self.val_data)
-        ):
+        if self.val_data is not None and not _is_empty(self.val_data):
             self.val_dataset = FtrainDataset(
                 self.val_data,
                 self.tokenizer,
@@ -1015,134 +602,153 @@ class Ftrain:
             self.val_dataset = None
 
         if _is_empty(self.train_dataset):
-            raise ValueError(
-                "Training dataset wrapper is empty."
-            )
-
-        self.total_steps = cfg.max_steps
-
-    # =========================================================================
-    # Dashboard
-    # =========================================================================
+            raise ValueError("Training dataset wrapper is empty.")
+        self.total_steps = max(1, int(cfg.max_steps))
 
     def _start_dashboard(self) -> None:
-        """Start optional dashboard in a daemon thread."""
-        cfg = self.config
-
-        if not cfg.use_dashboard:
-            self.dashboard = None
+        if not self.config.use_dashboard:
             return
-
-        from .dashboard import TrainingDashboard
-
-        self.dashboard = TrainingDashboard(
-            port=cfg.dashboard_port
-        )
-
-        thread = threading.Thread(
-            target=self.dashboard.start,
-            name="ftrain-dashboard",
-            daemon=True,
-        )
-
-        thread.start()
-
-        self._dashboard_started = True
+        try:
+            from .dashboard import TrainingDashboard
+            self.dashboard = TrainingDashboard(port=self.config.dashboard_port)
+            thread = threading.Thread(target=self.dashboard.start, name="ftrain-dashboard", daemon=True)
+            thread.start()
+            self._dashboard_started = True
+        except Exception:
+            self.dashboard = None
+            logger.warning("FTRAIN: dashboard could not start.", exc_info=True)
 
     def _stop_dashboard(self) -> None:
-        """Stop optional dashboard safely."""
         if self.dashboard is None:
             return
-
         try:
             self.dashboard.stop()
         except Exception:
-            logger.warning(
-                "FTRAIN: dashboard shutdown failed.",
-                exc_info=True,
-            )
+            logger.debug("FTRAIN: dashboard shutdown failed.", exc_info=True)
         finally:
             self.dashboard = None
             self._dashboard_started = False
 
     # =========================================================================
-    # Evaluation / inference
+    # Evaluation
     # =========================================================================
 
-    def _evaluate_model(
-        self,
-        prompt: str,
-    ) -> str:
-        """Generate a deterministic response from the current model."""
+    def _select_evaluation_example(self) -> Tuple[str, str]:
+        """
+        Select a deterministic, usable evaluation example.
+
+        IMPORTANT FIX:
+        This method is intentionally defined at class scope. The previous
+        file accidentally placed it inside ``train()`` after ``return result``,
+        which made it unreachable and caused AttributeError.
+        """
+        source = self.val_data
+        if source is None or _is_empty(source):
+            source = self.train_data
+
+        if source is None:
+            return "", ""
+
+        try:
+            length = len(source)
+        except TypeError:
+            return "", ""
+
+        if length <= 0:
+            return "", ""
+
+        indices = list(range(length))
+        rng = random.Random(int(self.config.seed) + 99173)
+        rng.shuffle(indices)
+
+        for index in indices[: min(32, length)]:
+            sample = source[index]
+            if not isinstance(sample, Mapping):
+                continue
+
+            messages = sample.get("messages")
+            if isinstance(messages, Sequence) and not isinstance(messages, (str, bytes)):
+                user_message = None
+                assistant_message = None
+                for message in messages:
+                    if not isinstance(message, Mapping):
+                        continue
+                    role = str(message.get("role", "")).lower()
+                    content = str(message.get("content", "")).strip()
+                    if role == "user" and content and user_message is None:
+                        user_message = {"role": "user", "content": content}
+                    elif role == "assistant" and content and assistant_message is None:
+                        assistant_message = content
+                    if user_message is not None and assistant_message is not None:
+                        break
+
+                if user_message is None:
+                    continue
+
+                prompt = user_message["content"]
+                try:
+                    prompt = self.tokenizer.apply_chat_template(
+                        [user_message],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                except Exception:
+                    pass
+
+                return str(prompt), str(assistant_message or "")
+
+            prompt = sample.get("prompt") or sample.get("question") or sample.get("query")
+            answer = sample.get("answer") or sample.get("response") or sample.get("solution")
+            if prompt:
+                return str(prompt), str(answer or "")
+
+            text = sample.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip(), ""
+
+        return "", ""
+
+    def _evaluate_model(self, prompt: str) -> str:
         if self.model is None or self.tokenizer is None:
             return "Evaluation unavailable: model/tokenizer missing."
 
-        was_training = self.model.training
-
+        was_training = bool(self.model.training)
         try:
             self.model.eval()
-
             try:
-                from unsloth import FastLanguageModel
-
-                FastLanguageModel.for_inference(
-                    self.model
-                )
+                FastLanguageModel.for_inference(self.model)
             except Exception:
-                logger.debug(
-                    "FTRAIN: Unsloth inference preparation unavailable.",
-                    exc_info=True,
-                )
+                pass
 
             inputs = self.tokenizer(
                 prompt,
                 return_tensors="pt",
                 truncation=True,
-                max_length=min(
-                    self.config.max_seq_length,
-                    512,
-                ),
+                max_length=min(int(self.config.max_seq_length), 512),
             )
+            inputs = self._move_to_device(inputs)
+            input_length = int(inputs["input_ids"].shape[-1])
 
-            inputs = {
-                key: value.to(self.device)
-                if isinstance(value, torch.Tensor)
-                else value
-                for key, value in inputs.items()
-            }
+            with torch.inference_mode(), self._autocast_context():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=100,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
 
-            input_length = int(
-                inputs["input_ids"].shape[-1]
-            )
-
-            with torch.inference_mode():
-                with self._autocast_context():
-                    output = self.model.generate(
-                        **inputs,
-                        max_new_tokens=100,
-                        do_sample=False,
-                        pad_token_id=self.tokenizer.eos_token_id,
-                    )
-
-            generated = output[
-                0,
-                input_length:,
-            ]
-
-            return self.tokenizer.decode(
-                generated,
-                skip_special_tokens=True,
-            ).strip()
-
+            generated = output[0, input_length:]
+            return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
         except Exception as exc:
-            logger.warning(
-                "FTRAIN: evaluation generation failed: %s",
-                exc,
-            )
+            logger.warning("FTRAIN: evaluation generation failed: %s", exc)
             return "Evaluation failed."
-
         finally:
             if was_training:
+                try:
+                    FastLanguageModel.for_training(self.model)
+                except Exception:
+                    pass
                 self.model.train()
 
     # =========================================================================
@@ -1150,344 +756,240 @@ class Ftrain:
     # =========================================================================
 
     def _build_opt(self) -> torch.optim.Optimizer:
-        """
-        Build parameter groups for adaptive training.
-
-        Groups:
-            early
-            late
-            gate
-            router
-            other
-
-        Parameter-group names are deliberately attached to the actual
-        optimizer groups because PhoenixCaptainCallback consumes them.
-        """
+        """Build grouped AdamW with semantic LR groups and proper no-decay handling."""
         cfg = self.config
-
         if self.model is None:
-            raise RuntimeError(
-                "Cannot build optimizer without a model."
-            )
+            raise RuntimeError("Cannot build optimizer without a model.")
 
-        early: List[Dict[str, Any]] = []
-        late: List[Dict[str, Any]] = []
-        gate: List[Dict[str, Any]] = []
-        router: List[Dict[str, Any]] = []
-        other: List[Dict[str, Any]] = []
+        buckets: Dict[str, Dict[str, List[torch.nn.Parameter]]] = {
+            role: {"decay": [], "nodecay": []}
+            for role in ("early", "late", "gate", "router", "lora_a", "lora_b", "other")
+        }
 
-        num_layers = max(
-            1,
-            get_num_layers(self.model),
-        )
+        layers = max(1, get_num_layers(self.model))
+        early_cutoff = max(1, layers // 3)
+        late_cutoff = max(early_cutoff, (2 * layers) // 3)
+        layer_pattern = re.compile(r"(?:layers|h|block|blocks)\.(\d+)\.")
 
-        early_cutoff = max(
-            1,
-            num_layers // 3,
-        )
+        def role_for(name: str) -> str:
+            lname = name.lower()
 
-        # Avoid matching only "layers.N"; support common architectures with
-        # layers / h / transformer blocks when possible.
-        layer_patterns = (
-            re.compile(r"(?:layers|h|block|blocks)\.(\d+)\."),
-        )
+            if "lora_a" in lname:
+                return "lora_a"
+            if "lora_b" in lname:
+                return "lora_b"
+            if "magnitude" in lname:
+                return "other"
+            if (
+                "router" in lname
+                or "router_logits" in lname
+                or "gate_logits" in lname
+                or "expert_gate" in lname
+            ):
+                return "router"
+            if "gate_proj" in lname or ".gate." in lname or lname.endswith(".gate.weight"):
+                return "gate"
+
+            match = layer_pattern.search(name)
+            if match:
+                idx = _safe_int(match.group(1), 0)
+                if idx < early_cutoff:
+                    return "early"
+                if idx >= late_cutoff:
+                    return "late"
+
+            return "other"
+
+        def needs_decay(name: str, parameter: torch.nn.Parameter) -> bool:
+            lname = name.lower()
+            if parameter.ndim < 2:
+                return False
+            if lname.endswith(".bias") or ".bias" in lname:
+                return False
+            if any(token in lname for token in ("norm", "layernorm", "rmsnorm", "ln_f")):
+                return False
+            return True
 
         for name, parameter in self.model.named_parameters():
             if not parameter.requires_grad:
                 continue
 
-            base_lr = float(
-                cfg.learning_rate
-            )
+            role = role_for(name)
+            bucket = "decay" if needs_decay(name, parameter) else "nodecay"
+            buckets[role][bucket].append(parameter)
 
-            lower_name = name.lower()
+        if not any(params for role in buckets.values() for params in role.values()):
+            raise RuntimeError("No trainable parameters were found after adapter setup.")
 
-            if "lora_a" in lower_name:
-                base_lr *= cfg.lora_a_lr_mult
-
-            elif "lora_b" in lower_name:
-                base_lr *= cfg.lora_b_lr_mult
-
-            # Router parameters must be classified before generic gate logic.
-            if (
-                "router" in lower_name
-                or "gate_logits" in lower_name
-                or "router_logits" in lower_name
-                or "expert_gate" in lower_name
-            ):
-                group = {
-                    "params": [parameter],
-                    "lr": base_lr * cfg.moe_router_lr_multiplier,
-                    "name": "router",
-                }
-
-                router.append(group)
-                continue
-
-            if (
-                "gate_proj" in lower_name
-                or "gate" in lower_name
-            ):
-                group = {
-                    "params": [parameter],
-                    "lr": (
-                        base_lr
-                        * cfg.swiglu_gate_boost
-                    ),
-                    "name": "gate",
-                }
-
-                gate.append(group)
-                continue
-
-            layer_index = self._find_layer_index(
-                name,
-                layer_patterns,
-            )
-
-            if layer_index is not None:
-                if layer_index < early_cutoff:
-                    early.append(
-                        {
-                            "params": [parameter],
-                            "lr": (
-                                base_lr
-                                * cfg.layerwise_lr_decay
-                            ),
-                            "name": "early",
-                        }
-                    )
-                else:
-                    late.append(
-                        {
-                            "params": [parameter],
-                            "lr": base_lr,
-                            "name": "late",
-                        }
-                    )
-
-                continue
-
-            other.append(
-                {
-                    "params": [parameter],
-                    "lr": base_lr,
-                    "name": "other",
-                }
-            )
-
-        groups = [
-            group
-            for group in (
-                early,
-                late,
-                gate,
-                router,
-                other,
-            )
-            if group
-        ]
-
-        if not groups:
-            raise RuntimeError(
-                "No trainable parameters were found after adapter setup."
-            )
-
-        optimizer_kwargs: Dict[str, Any] = {
-            "lr": cfg.learning_rate,
+        base_lr = float(cfg.learning_rate)
+        role_lr = {
+            "early": base_lr * float(cfg.layerwise_lr_decay),
+            "late": base_lr,
+            "gate": base_lr * float(cfg.swiglu_gate_boost),
+            "router": base_lr * float(cfg.moe_router_lr_multiplier),
+            "lora_a": base_lr * float(cfg.lora_a_lr_mult),
+            "lora_b": base_lr * float(cfg.lora_b_lr_mult),
+            "other": base_lr,
         }
 
-        # Fused AdamW is not available on every PyTorch/device combination.
-        if (
-            self.device.type == "cuda"
-            and "fused" in torch.optim.AdamW.__init__.__annotations__
-        ):
+        groups: List[Dict[str, Any]] = []
+
+        def add_group(role: str, decay_kind: str) -> None:
+            params = buckets[role][decay_kind]
+            if not params:
+                return
+            groups.append(
+                {
+                    "params": params,
+                    "lr": role_lr[role],
+                    "initial_lr": role_lr[role],
+                    "name": f"{role}:{decay_kind}",
+                    "captain_multiplier": 1.0,
+                    "weight_decay": 0.01 if decay_kind == "decay" else 0.0,
+                }
+            )
+
+        # Keep stable ordering so checkpoints restore deterministically.
+        for role in ("early", "late", "gate", "router", "lora_a", "lora_b", "other"):
+            add_group(role, "decay")
+            add_group(role, "nodecay")
+
+        optimizer_kwargs: Dict[str, Any] = {
+            "lr": base_lr,
+            "betas": (0.9, 0.999),
+            "eps": 1e-8,
+        }
+
+        if self.device.type == "cuda":
             optimizer_kwargs["fused"] = True
 
-        # The annotation test above isn't sufficient across all PyTorch
-        # versions. Try fused first, then safely fall back.
         try:
-            self.optimizer = torch.optim.AdamW(
-                groups,
-                **optimizer_kwargs,
-            )
-
+            self.optimizer = torch.optim.AdamW(groups, **optimizer_kwargs)
         except (TypeError, RuntimeError):
-            optimizer_kwargs.pop(
-                "fused",
-                None,
-            )
-
-            self.optimizer = torch.optim.AdamW(
-                groups,
-                **optimizer_kwargs,
-            )
-
-        assert self.optimizer is not None
-
-        for parameter_group in self.optimizer.param_groups:
-            parameter_group["initial_lr"] = float(
-                parameter_group["lr"]
-            )
-
-            # Explicit Captain multiplier metadata. This allows downstream
-            # systems to inspect the current unmodified baseline.
-            parameter_group["captain_multiplier"] = 1.0
+            optimizer_kwargs.pop("fused", None)
+            self.optimizer = torch.optim.AdamW(groups, **optimizer_kwargs)
 
         return self.optimizer
 
-    @staticmethod
-    def _find_layer_index(
-        name: str,
-        patterns: Sequence[re.Pattern[str]],
-    ) -> Optional[int]:
-        for pattern in patterns:
-            match = pattern.search(name)
+    # =========================================================================
+    # Scheduler
+    # =========================================================================
 
-            if match:
-                try:
-                    return int(
-                        match.group(1)
+    def _apply_captain_factor(self, group_name: str) -> float:
+        role = str(group_name).split(":", 1)[0]
+        return self._captain_mult * self._captain_layer_boosts.get(role, 1.0)
+
+    def _build_sched(self) -> Any:
+        cfg = self.config
+        if self.optimizer is None:
+            raise RuntimeError("Cannot build scheduler before optimizer.")
+
+        total_steps = max(1, self.total_steps)
+        warmup = cfg.warmup_steps if cfg.warmup_steps > 0 else int(cfg.warmup_ratio * total_steps)
+        warmup = max(0, min(warmup, total_steps))
+
+        if cfg.use_cosine_restarts:
+            self.scheduler = cosine_restart_scheduler(
+                self.optimizer,
+                cfg.learning_rate,
+                cfg.learning_rate * cfg.min_lr_ratio,
+                warmup,
+                total_steps,
+                cfg.restart_interval,
+            )
+            return self.scheduler
+
+        def make_lambda(group_name: str):
+            def lr_lambda(current_step: int) -> float:
+                if current_step < warmup:
+                    base_factor = current_step / max(1, warmup)
+                else:
+                    progress = (current_step - warmup) / max(1, total_steps - warmup)
+                    progress = max(0.0, min(1.0, progress))
+                    base_factor = cfg.min_lr_ratio + (1.0 - cfg.min_lr_ratio) * 0.5 * (
+                        1.0 + math.cos(math.pi * progress)
                     )
-                except (TypeError, ValueError):
-                    return None
 
-        return None
+                return base_factor * self._apply_captain_factor(group_name)
+
+            return lr_lambda
+
+        lambdas = [make_lambda(pg.get("name", "other")) for pg in self.optimizer.param_groups]
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambdas)
+        return self.scheduler
 
     # =========================================================================
-    # Autocast
+    # Autocast / gradients
     # =========================================================================
 
     @contextmanager
     def _autocast_context(self):
-        """
-        Use mixed precision only on supported devices.
-
-        The old implementation unconditionally used:
-            device_type="cuda"
-
-        which breaks on CPU and is unnecessary when mixed precision is not
-        available.
-        """
+        """Use safe automatic mixed precision for the active device."""
         if self.device.type == "cuda":
-            dtype = (
-                torch.float16
-                if self.config.load_in_4bit
-                else (
-                    torch.bfloat16
-                    if torch.cuda.is_bf16_supported()
-                    else torch.float16
+            try:
+                dtype = (
+                    torch.float16
+                    if self.config.load_in_4bit
+                    else (
+                        torch.bfloat16
+                        if torch.cuda.is_bf16_supported()
+                        else torch.float16
+                    )
                 )
-            )
-
-            with torch.autocast(
-                device_type="cuda",
-                dtype=dtype,
-            ):
+                with torch.autocast(device_type="cuda", dtype=dtype):
+                    yield
+                return
+            except Exception:
+                logger.debug("FTRAIN: CUDA autocast failed; using full precision for this operation.", exc_info=True)
                 yield
+                return
 
-        elif self.device.type == "mps":
-            with torch.autocast(
-                device_type="mps",
-                dtype=torch.float16,
-            ):
+        if self.device.type == "mps":
+            try:
+                with torch.autocast(device_type="mps", dtype=torch.float16):
+                    yield
+                return
+            except Exception:
+                logger.debug("FTRAIN: MPS autocast unavailable.", exc_info=True)
                 yield
+                return
 
-        else:
-            yield
-
-    # =========================================================================
-    # Gradient handling
-    # =========================================================================
+        yield
 
     def _clear_gradients(self) -> None:
-        """Clear model gradients safely."""
-        if self.model is None:
-            return
-
-        self.model.zero_grad(
-            set_to_none=True
-        )
-
+        if self.model is not None:
+            self.model.zero_grad(set_to_none=True)
         if self.optimizer is not None:
             try:
-                self.optimizer.zero_grad(
-                    set_to_none=True
-                )
+                self.optimizer.zero_grad(set_to_none=True)
             except Exception:
                 pass
 
-    def _compute_brain_activity(
-        self,
-    ) -> Tuple[float, float, float]:
-        """
-        Compute early/late/gate gradient norms.
-
-        This runs before ``optimizer.zero_grad()`` in the custom loop.
-        """
+    def _compute_brain_activity(self) -> Tuple[float, float, float]:
         if self.optimizer is None:
             return 0.0, 0.0, 0.0
 
-        squared = {
-            "early": 0.0,
-            "late": 0.0,
-            "gate": 0.0,
-        }
-
-        for parameter_group in self.optimizer.param_groups:
-            name = parameter_group.get(
-                "name",
-                "other",
-            )
-
+        squared = {"early": 0.0, "late": 0.0, "gate": 0.0}
+        for group in self.optimizer.param_groups:
+            name = group.get("name", "other")
             if name not in squared:
                 continue
-
-            for parameter in parameter_group.get(
-                "params",
-                (),
-            ):
-                gradient = getattr(
-                    parameter,
-                    "grad",
-                    None,
-                )
-
-                if gradient is None:
+            for parameter in group.get("params", ()):
+                grad = parameter.grad
+                if grad is None:
+                    continue
+                try:
+                    if grad.is_sparse:
+                        grad = grad.coalesce().values()
+                    value = grad.detach().float()
+                    squared[name] += float((value * value).sum().item())
+                except Exception:
                     continue
 
-                try:
-                    if gradient.is_sparse:
-                        gradient = gradient.coalesce().values()
-
-                    value = (
-                        gradient.detach()
-                        .float()
-                    )
-
-                    squared[name] += float(
-                        torch.sum(
-                            value * value
-                        ).item()
-                    )
-
-                except Exception:
-                    logger.debug(
-                        "FTRAIN: gradient activity calculation failed "
-                        "for one parameter.",
-                        exc_info=True,
-                    )
-
         return (
-            math.sqrt(
-                max(0.0, squared["early"])
-            ),
-            math.sqrt(
-                max(0.0, squared["late"])
-            ),
-            math.sqrt(
-                max(0.0, squared["gate"])
-            ),
+            math.sqrt(max(0.0, squared["early"])),
+            math.sqrt(max(0.0, squared["late"])),
+            math.sqrt(max(0.0, squared["gate"])),
         )
 
     # =========================================================================
@@ -1495,818 +997,693 @@ class Ftrain:
     # =========================================================================
 
     def train(self) -> Any:
-        """Run the selected FTRAIN training backend."""
         cfg = self.config
-
         if self.model is None:
-            raise RuntimeError(
-                "Training cannot begin without a model."
-            )
-
+            raise RuntimeError("Training cannot begin without a model.")
         if self.train_dataset is None:
-            raise RuntimeError(
-                "Training cannot begin without a dataset."
-            )
+            raise RuntimeError("Training cannot begin without a dataset.")
 
         self.model.train()
-
         ui.fire_header()
-
         print(
-            f"🧬 Model: {cfg.model_name} | "
-            f"Steps: {self.total_steps} | "
+            f"🧬 Model: {cfg.model_name} | Steps: {self.total_steps} | "
             f"Mode: {'GRPO' if cfg.use_grpo else 'SFT'} | "
-            f"Backend: "
-            f"{'HF/Unsloth' if cfg.use_hf_trainer else 'Custom'}"
+            f"Backend: {'HF/Unsloth' if cfg.use_hf_trainer else 'Custom'}"
         )
 
-        eval_prompt = ""
-        correct_answer = ""
+        eval_prompt, correct_answer = "", ""
         before_answer = ""
 
-        # ---------------------------------------------------------------
-        # Pre-training evaluation
-        # ---------------------------------------------------------------
-
-        if (
-            not cfg.use_grpo
-            and self.train_data is not None
-            and not _is_empty(self.train_data)
-            and self.captain is not None
-        ):
-            (
-                eval_prompt,
-                correct_answer,
-            ) = self._select_evaluation_example()
-
+        if not cfg.use_grpo and self.captain is not None:
+            eval_prompt, correct_answer = self._select_evaluation_example()
             if eval_prompt:
-                print(
-                    "\n🧠 Captain is asking the model "
-                    "a question before training..."
-                )
-
-                before_answer = self._evaluate_model(
-                    eval_prompt
-                )
+                print("\n🧠 Captain is asking the model a question before training...")
+                before_answer = self._evaluate_model(eval_prompt)
 
         try:
             if cfg.use_grpo:
                 result = self._train_grpo()
-
             elif cfg.use_hf_trainer:
                 result = self._train_hf()
-
             else:
                 result = self._train_custom()
-
         finally:
             self._stop_dashboard()
 
-        # ---------------------------------------------------------------
-        # Post-training evaluation
-        # ---------------------------------------------------------------
-
-        if (
-            self.captain is not None
-            and eval_prompt
-        ):
-            print(
-                "\n🧠 Captain is asking the model "
-                "the same question after training..."
-            )
-
-            after_answer = self._evaluate_model(
-                eval_prompt
-            )
-
-            self.captain.evaluate_improvement(
-                eval_prompt,
-                before_answer,
-                after_answer,
-                correct_answer,
-            )
+        if self.captain is not None and eval_prompt:
+            print("\n🧠 Captain is asking the model the same question after training...")
+            after_answer = self._evaluate_model(eval_prompt)
+            try:
+                self.captain.evaluate_improvement(
+                    eval_prompt,
+                    before_answer,
+                    after_answer,
+                    correct_answer,
+                )
+            except Exception:
+                logger.debug("FTRAIN: Captain improvement evaluation failed.", exc_info=True)
 
         return result
 
-        def _select_evaluation_example(
-        self,
-    ) -> Tuple[str, str]:
-      
-            if not self.train_data:
-                return "", ""
+    # =========================================================================
+    # Captain
+    # =========================================================================
+
+    def _apply_captain_advice(self, advice: Mapping[str, Any]) -> None:
+        multiplier = _clamp(
+            _safe_float(advice.get("mult", 1.0), 1.0),
+            _safe_float(getattr(self.config, "captain_mult_min", 0.25), 0.25),
+            _safe_float(getattr(self.config, "captain_mult_max", 2.5), 2.5),
+        )
+        self._captain_mult = multiplier
+
+        layer = str(advice.get("layer_boost", "none")).strip().lower()
+        boost = max(0.0, _safe_float(getattr(self.config, "captain_layer_boost", 2.0), 2.0))
+        self._captain_layer_boosts = {group: 1.0 for group in self._captain_layer_boosts}
+        if layer == "all":
+            self._captain_layer_boosts = {group: boost for group in self._captain_layer_boosts}
+        elif layer in self._captain_layer_boosts:
+            self._captain_layer_boosts[layer] = boost
+
+        if self.optimizer is not None:
+            for group in self.optimizer.param_groups:
+                role = str(group.get("name", "other")).split(":", 1)[0]
+                group["captain_multiplier"] = self._apply_captain_factor(role)
+
+    # =========================================================================
+    # Dataloader / validation
+    # =========================================================================
+
+    def _dataloader(self, dataset: Any, shuffle: bool = True) -> DataLoader:
+        if dataset is None:
+            raise ValueError("Cannot create DataLoader from None.")
+
+        collator = partial(
+            collate,
+            pad_token_id=getattr(self.tokenizer, "pad_token_id", None) or 0,
+        )
+
+        lengths = getattr(dataset, "lengths", None)
+        if lengths is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(self.config.seed) + int(self.epoch))
+            return DataLoader(
+                dataset,
+                batch_size=max(1, int(self.config.per_device_batch_size)),
+                shuffle=shuffle,
+                collate_fn=collator,
+                num_workers=max(0, int(self.config.dataloader_num_workers)),
+                pin_memory=bool(self.config.pin_memory and self.device.type == "cuda"),
+                persistent_workers=(
+                    self.config.dataloader_num_workers > 0
+                ),
+                generator=generator,
+            )
+
+        sampler = LengthSampler(
+            lengths,
+            max(1, int(self.config.per_device_batch_size)),
+            shuffle,
+            int(self.config.seed) + int(self.epoch),
+        )
+        return DataLoader(
+            dataset,
+            batch_size=max(1, int(self.config.per_device_batch_size)),
+            sampler=sampler,
+            collate_fn=collator,
+            num_workers=max(0, int(self.config.dataloader_num_workers)),
+            pin_memory=bool(self.config.pin_memory and self.device.type == "cuda"),
+            persistent_workers=(
+                self.config.dataloader_num_workers > 0
+            ),
+        )
+
+    def validate(self, max_batches: Optional[int] = None) -> Optional[float]:
+        if self.val_dataset is None or self.model is None:
+            return None
+
+        was_training = self.model.training
+        self.model.eval()
+        total_loss = 0.0
+        batches = 0
 
         try:
-            length = len(self.train_data)
-        except TypeError:
-            return "", ""
+            loader = self._dataloader(self.val_dataset, shuffle=False)
+            with torch.inference_mode():
+                for batch in loader:
+                    if max_batches is not None and batches >= max_batches:
+                        break
 
-        indices = list(range(length))
-        random.shuffle(indices)
+                    input_ids = self._move_to_device(batch.get("input_ids"))
+                    if input_ids is None:
+                        continue
+                    attention_mask = self._move_to_device(batch.get("attention_mask"))
+                    if attention_mask is None:
+                        attention_mask = torch.ones_like(input_ids)
+                    labels = self._move_to_device(batch.get("labels"))
+                    if labels is None:
+                        labels = input_ids
 
-        for index in indices[:min(20, length)]:
-            sample = self.train_data[index]
+                    with self._autocast_context():
+                        output = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
+                        )
+                    loss = getattr(output, "loss", None)
+                    if loss is None or not torch.isfinite(loss):
+                        continue
+                    total_loss += float(loss.item())
+                    batches += 1
 
-            if not isinstance(sample, Mapping):
-                continue
+            result = total_loss / max(1, batches)
+            self._last_val_loss = result
+            self.val_loss_history.append(result)
+            if self._best_val_loss is None or result < self._best_val_loss:
+                self._best_val_loss = result
+                self._bad_eval_count = 0
+            else:
+                self._bad_eval_count += 1
+            return result
+        finally:
+            if was_training:
+                self.model.train()
 
-            messages = sample.get("messages", [])
+    # =========================================================================
+    # HF / Unsloth training
+    # =========================================================================
 
-            if not isinstance(messages, Sequence):
-                continue
+    def _build_training_arguments(self, argument_class: Any) -> Any:
+        cfg = self.config
+        kwargs: Dict[str, Any] = {
+            "output_dir": cfg.output_dir,
+            "max_steps": cfg.max_steps,
+            "per_device_train_batch_size": cfg.per_device_batch_size,
+            "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+            "learning_rate": cfg.learning_rate,
+            "warmup_ratio": cfg.warmup_ratio,
+            "logging_steps": max(1, cfg.captain_interval),
+            "save_strategy": "steps",
+            "save_steps": max(1, cfg.checkpoint_interval),
+            "save_total_limit": cfg.save_total_limit,
+            "gradient_checkpointing": cfg.gradient_checkpointing_enable,
+            "dataloader_num_workers": max(0, cfg.dataloader_num_workers),
+            "report_to": cfg.report_to,
+            "remove_unused_columns": False,
+            "max_grad_norm": cfg.max_grad_norm,
+            "seed": cfg.seed,
+            "bf16": bool(
+                self.device.type == "cuda"
+                and not cfg.load_in_4bit
+                and torch.cuda.is_bf16_supported()
+            ),
+            "fp16": bool(
+                self.device.type == "cuda"
+                and cfg.load_in_4bit
+                and not torch.cuda.is_bf16_supported()
+            ),
+            "group_by_length": bool(cfg.group_by_length),
+        }
 
-            if len(messages) < 2:
-                continue
+        if self.val_dataset is not None:
+            if "eval_strategy" in self._supported_parameters(argument_class):
+                kwargs["eval_strategy"] = "steps"
+            elif "evaluation_strategy" in self._supported_parameters(argument_class):
+                kwargs["evaluation_strategy"] = "steps"
+            kwargs["eval_steps"] = max(1, int(cfg.eval_interval))
+        else:
+            if "eval_strategy" in self._supported_parameters(argument_class):
+                kwargs["eval_strategy"] = "no"
+            elif "evaluation_strategy" in self._supported_parameters(argument_class):
+                kwargs["evaluation_strategy"] = "no"
 
-            user_message = messages[0]
+        if "gradient_checkpointing_kwargs" in self._supported_parameters(argument_class):
+            kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
 
-            if not isinstance(user_message, Mapping):
-                continue
+        supported = self._supported_parameters(argument_class)
+        filtered = {key: value for key, value in kwargs.items() if key in supported}
+        return argument_class(**filtered)
 
-            # FIX: Use str() instead of the missing _safe_text()
-            prompt = str(user_message.get("content", "")).strip()
-            
-            correct_msg = messages[1] if isinstance(messages[1], Mapping) else {}
-            correct = str(correct_msg.get("content", "")).strip()
+    @staticmethod
+    def _supported_parameters(callable_object: Any) -> set[str]:
+        try:
+            signature = inspect.signature(callable_object.__init__)
+            return {name for name in signature.parameters if name != "self"}
+        except Exception:
+            return set()
 
-            if not prompt or not correct:
-                continue
+    def _build_unsloth_trainer(self, callback: Any) -> Any:
+        from unsloth import UnslothTrainer, UnslothTrainingArguments
+        args = self._build_training_arguments(UnslothTrainingArguments)
+        supported = self._supported_parameters(UnslothTrainer)
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "args": args,
+            "train_dataset": self.train_dataset,
+            "eval_dataset": self.val_dataset,
+            "data_collator": partial(
+                collate,
+                pad_token_id=getattr(self.tokenizer, "pad_token_id", None) or 0,
+            ),
+        }
 
+        if "processing_class" in supported:
+            kwargs["processing_class"] = self.tokenizer
+        elif "tokenizer" in supported:
+            kwargs["tokenizer"] = self.tokenizer
+
+        if "optimizers" in supported:
+            if self.optimizer is None:
+                self._build_opt()
+            kwargs["optimizers"] = (self.optimizer, None)
+
+        if callback is not None and "callbacks" in supported:
+            kwargs["callbacks"] = [callback]
+
+        return UnslothTrainer(**{k: v for k, v in kwargs.items() if k in supported})
+
+    def _build_transformers_trainer(self, callback: Any) -> Any:
+        from transformers import Trainer, TrainingArguments
+        args = self._build_training_arguments(TrainingArguments)
+        supported = self._supported_parameters(Trainer)
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "args": args,
+            "train_dataset": self.train_dataset,
+            "eval_dataset": self.val_dataset,
+            "data_collator": partial(
+                collate,
+                pad_token_id=getattr(self.tokenizer, "pad_token_id", None) or 0,
+            ),
+        }
+        if "processing_class" in supported:
+            kwargs["processing_class"] = self.tokenizer
+        elif "tokenizer" in supported:
+            kwargs["tokenizer"] = self.tokenizer
+        if self.optimizer is None:
+            self._build_opt()
+        if "optimizers" in supported:
+            kwargs["optimizers"] = (self.optimizer, None)
+        if callback is not None and "callbacks" in supported:
+            kwargs["callbacks"] = [callback]
+        return Trainer(**{k: v for k, v in kwargs.items() if k in supported})
+
+    def _sync_trainer_state(self, trainer: Any) -> None:
+        state = getattr(trainer, "state", None)
+        if state is not None:
+            self.step = max(self.step, _safe_int(getattr(state, "global_step", self.step), self.step))
+            self.epoch = max(self.epoch, _safe_int(getattr(state, "epoch", self.epoch), self.epoch))
+
+    def _make_hf_captain_callback(self) -> Any:
+        """Build a Trainer callback that is the single Captain LR controller."""
+        if not self.config.captain_enabled or self.captain is None:
+            return None
+
+        engine = self
+
+        class _CaptainCallback(TrainerCallback):
+            def _latest_metrics(self, state: Any) -> Tuple[float, Optional[float], float]:
+                history = getattr(state, "log_history", None) or []
+                latest: Mapping[str, Any] = history[-1] if history else {}
+                loss = _safe_float(latest.get("loss", engine._last_loss or 0.0), 0.0)
+                val_loss = latest.get("eval_loss", engine._last_val_loss)
+                if val_loss is not None:
+                    val_loss = _safe_float(val_loss, float("nan"))
+                lr = _safe_float(latest.get("learning_rate", engine._current_learning_rate()), engine._current_learning_rate())
+                return loss, val_loss, lr
+
+            def _apply_runtime_multiplier(self) -> None:
+                if engine.optimizer is None:
+                    return
+                for group in engine.optimizer.param_groups:
+                    role = str(group.get("name", "other")).split(":", 1)[0]
+                    multiplier = engine._apply_captain_factor(role)
+                    group["captain_multiplier"] = multiplier
+                    # Trainer's scheduler owns the base LR. Captain only
+                    # applies a multiplicative overlay after the scheduler step.
+                    scheduler_base = group.get("_ftrain_scheduler_lr")
+                    if scheduler_base is not None:
+                        group["lr"] = float(scheduler_base) * multiplier
+
+            def on_step_end(self, args, state, control, **kwargs):
+                engine._sync_trainer_state(kwargs.get("model") and kwargs.get("trainer") or engine._hf_trainer)
+                trainer = kwargs.get("trainer") or engine._hf_trainer
+                optimizer = getattr(trainer, "optimizer", None) if trainer is not None else None
+                if optimizer is not None:
+                    engine.optimizer = optimizer
+                scheduler = getattr(trainer, "lr_scheduler", None) if trainer is not None else None
+                if scheduler is not None:
+                    engine.scheduler = scheduler
+
+                if engine.optimizer is not None:
+                    for group in engine.optimizer.param_groups:
+                        group["_ftrain_scheduler_lr"] = float(group.get("lr", engine.config.learning_rate))
+
+                interval = max(1, int(engine.config.captain_interval))
+                if engine.captain is None or state.global_step <= 0:
+                    self._apply_runtime_multiplier()
+                    return
+                if state.global_step % interval != 0:
+                    self._apply_runtime_multiplier()
+                    return
+
+                loss, val_loss, lr = self._latest_metrics(state)
+                brain = engine._compute_brain_activity()
+                try:
+                    advice = engine.captain.inspect_training(
+                        state.global_step,
+                        loss,
+                        lr,
+                        _safe_float(getattr(state, "grad_norm", 0.0), 0.0),
+                        brain,
+                        val_loss,
+                    )
+                    if advice:
+                        engine._apply_captain_advice(advice)
+                        action = advice.get("action", "Keep LR")
+                        mult = _safe_float(advice.get("mult", 1.0), 1.0)
+                        try:
+                            ui.print_train_table(
+                                state.global_step,
+                                engine.total_steps,
+                                loss,
+                                val_loss,
+                                lr,
+                                _safe_float(getattr(state, "grad_norm", 0.0), 0.0),
+                                f"{action} (x{mult:.2f})",
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    logger.warning("FTRAIN: Captain inspection failed in Trainer callback.", exc_info=True)
+
+                self._apply_runtime_multiplier()
+
+        return _CaptainCallback()
+
+    def _train_hf(self) -> Any:
+        cfg = self.config
+        self._build_opt()
+
+        callback = self._make_hf_captain_callback()
+
+        trainer = None
+        if cfg.use_unsloth_trainer:
             try:
-                rendered = self.tokenizer.apply_chat_template(
-                    [user_message],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            except Exception:
-                rendered = prompt
+                trainer = self._build_unsloth_trainer(callback)
+                logger.info("FTRAIN: using UnslothTrainer backend.")
+            except (ImportError, AttributeError, TypeError, ValueError) as exc:
+                logger.warning("FTRAIN: UnslothTrainer unavailable/incompatible: %s", exc)
 
-            return rendered, correct
+        if trainer is None:
+            trainer = self._build_transformers_trainer(callback)
+            logger.info("FTRAIN: using Transformers Trainer fallback.")
 
-        return "", ""
+        self._hf_trainer = trainer
+        self.optimizer = getattr(trainer, "optimizer", self.optimizer)
+        self.scheduler = getattr(trainer, "lr_scheduler", self.scheduler)
+
+        resume = cfg.resume_from_checkpoint or None
+        trainer.train(resume_from_checkpoint=resume)
+
+        # Trainer owns the actual scheduler/optimizer on this path. Keep exact
+        # references so diagnostics and final checkpoint metadata reflect the
+        # real state rather than FTRAIN's pre-construction placeholders.
+        self.optimizer = getattr(trainer, "optimizer", self.optimizer)
+        self.scheduler = getattr(trainer, "lr_scheduler", self.scheduler)
+        self._hf_optimizer = self.optimizer
+        self._hf_scheduler = self.scheduler
+        self._sync_trainer_state(trainer)
+
+        # Persist the Trainer's state in its native format as well as FTRAIN's
+        # compact runtime metadata. This makes resume much more reliable.
+        try:
+            trainer.save_state()
+        except Exception:
+            logger.debug("FTRAIN: trainer.save_state() failed.", exc_info=True)
+
+        return self._finalize_model(trainer.model, mode="SFT")
 
     # =========================================================================
     # GRPO
     # =========================================================================
 
-    def _train_grpo(self) -> Any:
-        """Run GRPO through TRL."""
-        cfg = self.config
-
-        if self.model is None:
-            raise RuntimeError(
-                "GRPO training requires a model."
-            )
-
-        from trl import (
-            GRPOConfig,
-            GRPOTrainer,
-        )
-
-        if not cfg.grpo_reward_funcs:
-            raise ValueError(
-                "GRPO training requires at least one reward function."
-            )
-
-        grpo_data = self._build_grpo_dataset()
-
-        if not grpo_data:
-            raise ValueError(
-                "No valid GRPO training examples were produced."
-            )
-
-        trainer_config = GRPOConfig(
-            output_dir=cfg.output_dir,
-            max_steps=cfg.max_steps,
-            learning_rate=cfg.learning_rate,
-            logging_steps=cfg.captain_interval,
-            save_steps=cfg.checkpoint_interval,
-            per_device_train_batch_size=cfg.per_device_batch_size,
-            gradient_accumulation_steps=(
-                cfg.gradient_accumulation_steps
-            ),
-            num_generations=cfg.grpo_num_generations,
-            max_prompt_length=512,
-            max_completion_length=1024,
-            temperature=0.7,
-            beta=0.01,
-            report_to="none",
-            bf16=(
-                self.device.type == "cuda"
-                and not cfg.load_in_4bit
-                and torch.cuda.is_bf16_supported()
-            ),
-            fp16=(
-                self.device.type == "cuda"
-                and cfg.load_in_4bit
-                and not torch.cuda.is_bf16_supported()
-            ),
-            gradient_checkpointing=(
-                cfg.gradient_checkpointing_enable
-            ),
-            remove_unused_columns=False,
-        )
-
-        trainer = GRPOTrainer(
-            model=self.model,
-            processing_class=self.tokenizer,
-            reward_funcs=cfg.grpo_reward_funcs,
-            args=trainer_config,
-            train_dataset=grpo_data,
-        )
-
-        trainer.train(
-            resume_from_checkpoint=(
-                cfg.resume_from_checkpoint
-            )
-        )
-
-        return self._finalize_model(
-            trainer.model,
-            mode="GRPO",
-        )
-
     def _build_grpo_dataset(self) -> List[Dict[str, Any]]:
-        """Normalize FTRAIN examples to the format expected by GRPO."""
         result: List[Dict[str, Any]] = []
-
         for example in self.train_data:
             if not isinstance(example, Mapping):
                 continue
-
             if "messages" in example:
                 messages = example["messages"]
-
-                if not isinstance(
-                    messages,
-                    Sequence,
-                ):
+                if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
                     continue
-
                 prompt_messages = [
                     message
                     for message in messages
-                    if isinstance(message, Mapping)
-                    and message.get("role") != "assistant"
+                    if isinstance(message, Mapping) and message.get("role") != "assistant"
                 ]
-
                 if not prompt_messages:
                     continue
-
                 try:
-                    prompt = (
-                        self.tokenizer.apply_chat_template(
-                            prompt_messages,
-                            tokenize=False,
-                            add_generation_prompt=True,
-                        )
+                    prompt = self.tokenizer.apply_chat_template(
+                        prompt_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
                     )
                 except Exception:
                     prompt = "\n".join(
-                        (
-                            f"{message.get('role', 'user')}: "
-                            f"{message.get('content', '')}"
-                        )
+                        f"{message.get('role', 'user')}: {message.get('content', '')}"
                         for message in prompt_messages
                     )
-
-                result.append(
-                    {
-                        "prompt": prompt,
-                        "solution": example.get(
-                            "solution",
-                            "",
-                        ),
-                    }
-                )
-
+                result.append({"prompt": prompt, "solution": example.get("solution", "")})
             elif "prompt" in example:
-                result.append(
-                    dict(example)
-                )
-
+                result.append(dict(example))
         return result
 
-    # =========================================================================
-    # Hugging Face / Unsloth Trainer
-    # =========================================================================
-
-    def _train_hf(self) -> Any:
-        """Run the Hugging Face/Unsloth Trainer backend."""
+    def _train_grpo(self) -> Any:
+        from trl import GRPOConfig, GRPOTrainer
         cfg = self.config
+        if self.model is None:
+            raise RuntimeError("GRPO training requires a model.")
+        if not cfg.grpo_reward_funcs:
+            raise ValueError("GRPO training requires at least one reward function.")
 
-        self._build_opt()
+        grpo_data = self._build_grpo_dataset()
+        if not grpo_data:
+            raise ValueError("No valid GRPO training examples were produced.")
 
-        callback = None
-
-        if cfg.captain_enabled:
-            from .callbacks import (
-                PhoenixCaptainCallback,
-            )
-
-            callback = PhoenixCaptainCallback(
-                cfg,
-                self.model,
-                self.tokenizer,
-                self.train_dataset,
-                self.dashboard,
-            )
-
-        trainer = None
-
-        try:
-            if cfg.use_unsloth_trainer:
-                trainer = self._build_unsloth_trainer(
-                    callback
-                )
-
-        except (ImportError, AttributeError, TypeError) as exc:
-            logger.warning(
-                "FTRAIN: Unsloth Trainer unavailable or incompatible: %s",
-                exc,
-            )
-
-        if trainer is None:
-            trainer = self._build_transformers_trainer(
-                callback
-            )
-
-        trainer.train(
-            resume_from_checkpoint=(
-                cfg.resume_from_checkpoint
-            )
-        )
-
-        return self._finalize_model(
-            trainer.model,
-            mode="SFT",
-        )
-
-    def _build_unsloth_trainer(
-        self,
-        callback: Any,
-    ) -> Any:
-        """Construct the Unsloth trainer."""
-        from unsloth import (
-            UnslothTrainer,
-            UnslothTrainingArguments,
-        )
-
-        cfg = self.config
-
-        training_args = self._build_training_arguments(
-            UnslothTrainingArguments
-        )
-
-        return UnslothTrainer(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            args=training_args,
-            train_dataset=self.train_dataset,
-            eval_dataset=self.val_dataset,
-            data_collator=partial(
-                collate,
-                pad_token_id=(
-                    self.tokenizer.pad_token_id
-                    or 0
-                ),
-            ),
-            optimizers=(
-                self.optimizer,
-                None,
-            ),
-            callbacks=(
-                [callback]
-                if callback is not None
-                else None
-            ),
-        )
-
-    def _build_transformers_trainer(
-        self,
-        callback: Any,
-    ) -> Any:
-        """Construct the standard Transformers Trainer."""
-        from transformers import (
-            Trainer,
-            TrainingArguments,
-        )
-
-        training_args = self._build_training_arguments(
-            TrainingArguments
-        )
-
-        return Trainer(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            args=training_args,
-            train_dataset=self.train_dataset,
-            eval_dataset=self.val_dataset,
-            data_collator=partial(
-                collate,
-                pad_token_id=(
-                    self.tokenizer.pad_token_id
-                    or 0
-                ),
-            ),
-            optimizers=(
-                self.optimizer,
-                None,
-            ),
-            callbacks=(
-                [callback]
-                if callback is not None
-                else None
-            ),
-        )
-
-    def _build_training_arguments(
-        self,
-        argument_class: Any,
-    ) -> Any:
-        """
-        Build training arguments while keeping version-sensitive options
-        conservative.
-        """
-        cfg = self.config
-
+        supported = self._supported_parameters(GRPOConfig)
         kwargs: Dict[str, Any] = {
             "output_dir": cfg.output_dir,
             "max_steps": cfg.max_steps,
-            "per_device_train_batch_size": (
-                cfg.per_device_batch_size
-            ),
-            "gradient_accumulation_steps": (
-                cfg.gradient_accumulation_steps
-            ),
             "learning_rate": cfg.learning_rate,
-            "warmup_ratio": cfg.warmup_ratio,
-            "logging_steps": cfg.captain_interval,
-            "save_strategy": "steps",
-            "save_steps": cfg.checkpoint_interval,
-            "save_total_limit": cfg.save_total_limit,
-            "gradient_checkpointing": (
-                cfg.gradient_checkpointing_enable
-            ),
-            "dataloader_num_workers": (
-                cfg.dataloader_num_workers
-            ),
-            "report_to": cfg.report_to,
+            "logging_steps": max(1, cfg.captain_interval),
+            "save_steps": max(1, cfg.checkpoint_interval),
+            "per_device_train_batch_size": cfg.per_device_batch_size,
+            "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+            "num_generations": cfg.grpo_num_generations,
+            "max_prompt_length": 512,
+            "max_completion_length": 1024,
+            "temperature": 0.7,
+            "beta": 0.01,
+            "report_to": "none",
+            "bf16": bool(self.device.type == "cuda" and not cfg.load_in_4bit and torch.cuda.is_bf16_supported()),
+            "fp16": bool(self.device.type == "cuda" and cfg.load_in_4bit and not torch.cuda.is_bf16_supported()),
+            "gradient_checkpointing": cfg.gradient_checkpointing_enable,
             "remove_unused_columns": False,
-            "max_grad_norm": cfg.max_grad_norm,
-            "seed": cfg.seed,
-            "bf16": (
-                self.device.type == "cuda"
-                and not cfg.load_in_4bit
-                and torch.cuda.is_bf16_supported()
-            ),
-            "fp16": (
-                self.device.type == "cuda"
-                and cfg.load_in_4bit
-                and not torch.cuda.is_bf16_supported()
-            ),
         }
+        trainer_config = GRPOConfig(**{k: v for k, v in kwargs.items() if k in supported})
 
-        if self.val_dataset is not None:
-            kwargs["eval_strategy"] = "steps"
-            kwargs["eval_steps"] = max(
-                1,
-                cfg.eval_interval,
-            )
-        else:
-            kwargs["eval_strategy"] = "no"
+        trainer_supported = self._supported_parameters(GRPOTrainer)
+        trainer_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "args": trainer_config,
+            "reward_funcs": cfg.grpo_reward_funcs,
+            "train_dataset": grpo_data,
+        }
+        if "processing_class" in trainer_supported:
+            trainer_kwargs["processing_class"] = self.tokenizer
+        elif "tokenizer" in trainer_supported:
+            trainer_kwargs["tokenizer"] = self.tokenizer
 
-        # Filter arguments according to the installed class signature. This
-        # makes the engine considerably less brittle across Transformers/
-        # Unsloth versions.
+        trainer = GRPOTrainer(**{k: v for k, v in trainer_kwargs.items() if k in trainer_supported})
+        self._hf_trainer = trainer
+        trainer.train(resume_from_checkpoint=cfg.resume_from_checkpoint or None)
+        self.optimizer = getattr(trainer, "optimizer", self.optimizer)
+        self.scheduler = getattr(trainer, "lr_scheduler", self.scheduler)
+        self._hf_optimizer = self.optimizer
+        self._hf_scheduler = self.scheduler
+        self._sync_trainer_state(trainer)
         try:
-            import inspect
-
-            signature = inspect.signature(
-                argument_class.__init__
-            )
-
-            supported = {
-                name
-                for name in signature.parameters
-                if name != "self"
-            }
-
-            kwargs = {
-                key: value
-                for key, value in kwargs.items()
-                if key in supported
-            }
-
+            trainer.save_state()
         except Exception:
-            logger.debug(
-                "FTRAIN: unable to inspect training argument signature.",
-                exc_info=True,
-            )
-
-        return argument_class(
-            **kwargs
-        )
+            logger.debug("FTRAIN: GRPO trainer.save_state() failed.", exc_info=True)
+        return self._finalize_model(trainer.model, mode="GRPO")
 
     # =========================================================================
-    # Custom training
+    # Native custom loop
     # =========================================================================
 
     def _train_custom(self) -> torch.nn.Module:
-        """Run FTRAIN's native training loop."""
         cfg = self.config
-
         self._build_opt()
         self._build_sched()
 
+        if cfg.resume_from_checkpoint:
+            try:
+                self.load_training_state(cfg.resume_from_checkpoint)
+            except Exception:
+                logger.warning("FTRAIN: resume state restoration failed; starting optimizer state fresh.", exc_info=True)
+
         if self.captain is not None:
-            self.captain.set_family_context(
-                self.family,
-                is_moe(self.model),
-            )
+            try:
+                self.captain.set_family_context(self.family, is_moe(self.model))
+                self.captain.analyze_data(self.train_dataset, self.tokenizer)
+            except Exception:
+                logger.debug("FTRAIN: Captain custom-loop setup failed.", exc_info=True)
 
-            if self.train_dataset is not None:
-                self.captain.analyze_data(
-                    self.train_dataset,
-                    self.tokenizer,
-                )
-
-        loader = self._dataloader(
-            self.train_dataset,
-            shuffle=True,
-        )
-
+        loader = self._dataloader(self.train_dataset, shuffle=True)
         iterator = iter(loader)
-
         accumulated_loss = 0.0
         accumulated_micro_steps = 0
-
-        latest_val_loss: Optional[float] = None
+        latest_val_loss: Optional[float] = self._last_val_loss
         latest_grad_norm = 0.0
-        latest_lr = self._current_learning_rate()
-
-        current_accumulation = max(
-            1,
-            cfg.gradient_accumulation_steps,
-        )
-
         status_message = ""
-
         self._clear_gradients()
 
         while self.step < self.total_steps:
             try:
                 batch = next(iterator)
-
             except StopIteration:
                 self.epoch += 1
-
-                sampler = getattr(
-                    loader,
-                    "sampler",
-                    None,
-                )
-
-                if hasattr(
-                    sampler,
-                    "set_epoch",
-                ):
-                    sampler.set_epoch(
-                        self.epoch
-                    )
-
+                sampler = getattr(loader, "sampler", None)
+                if hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(self.epoch)
                 iterator = iter(loader)
                 batch = next(iterator)
 
-            # ----------------------------------------------------------
-            # Adaptive accumulation
-            # ----------------------------------------------------------
+            # Choose accumulation target ONCE per optimizer cycle. This avoids
+            # changing the denominator halfway through an accumulated gradient.
+            if accumulated_micro_steps == 0:
+                if cfg.use_adaptive_accumulation:
+                    try:
+                        token_count = int(batch["input_ids"].numel())
+                        self._accumulation_target = max(
+                            1,
+                            int(
+                                adaptive_accumulation(
+                                    cfg.gradient_accumulation_steps,
+                                    token_count,
+                                    cfg.target_batch_tokens,
+                                )
+                            ),
+                        )
+                    except Exception:
+                        self._accumulation_target = max(1, int(cfg.gradient_accumulation_steps))
+                else:
+                    self._accumulation_target = max(1, int(cfg.gradient_accumulation_steps))
+                self._current_accumulation_steps = self._accumulation_target
 
-            if cfg.use_adaptive_accumulation:
-                try:
-                    token_count = int(
-                        batch["input_ids"].numel()
-                    )
-
-                    current_accumulation = max(
-                        1,
-                        adaptive_accumulation(
-                            cfg.gradient_accumulation_steps,
-                            token_count,
-                            cfg.target_batch_tokens,
-                        ),
-                    )
-
-                except Exception:
-                    current_accumulation = (
-                        cfg.gradient_accumulation_steps
-                    )
-
-            else:
-                current_accumulation = (
-                    cfg.gradient_accumulation_steps
-                )
-
-            self._current_accumulation_steps = (
-                current_accumulation
-            )
-
-            # ----------------------------------------------------------
-            # Move batch
-            # ----------------------------------------------------------
-
-            input_ids = self._move_to_device(
-                batch.get("input_ids")
-            )
-
+            input_ids = self._move_to_device(batch.get("input_ids"))
             if input_ids is None:
-                raise RuntimeError(
-                    "Training batch contains no input_ids."
-                )
+                raise RuntimeError("Training batch contains no input_ids.")
 
-            attention_mask = batch.get(
-                "attention_mask"
-            )
-
+            attention_mask = self._move_to_device(batch.get("attention_mask"))
             if attention_mask is None:
-                attention_mask = torch.ones_like(
-                    input_ids
-                )
-            else:
-                attention_mask = self._move_to_device(
-                    attention_mask
-                )
-
-            labels = batch.get(
-                "labels"
-            )
-
+                attention_mask = torch.ones_like(input_ids)
+            labels = self._move_to_device(batch.get("labels"))
             if labels is None:
                 labels = input_ids
-            else:
-                labels = self._move_to_device(
-                    labels
-                )
 
-            # ----------------------------------------------------------
-            # Forward
-            # ----------------------------------------------------------
+            try:
+                with self._autocast_context():
+                    output = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+                    raw_loss = getattr(output, "loss", None)
 
-            with self._autocast_context():
-                output = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                )
+                if raw_loss is None:
+                    raise RuntimeError("Model returned no loss during custom training.")
+                if not torch.isfinite(raw_loss):
+                    self._skipped_steps += 1
+                    self._clear_gradients()
+                    continue
 
-                raw_loss = output.loss
+                scaled_loss = raw_loss / self._accumulation_target
+                scaled_loss.backward()
 
-            if raw_loss is None:
-                raise RuntimeError(
-                    "Model returned no loss during custom training."
-                )
+                raw_loss_value = _safe_float(raw_loss.detach().item())
+                accumulated_loss += raw_loss_value
+                accumulated_micro_steps += 1
 
-            loss = (
-                raw_loss
-                / current_accumulation
-            )
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    self._clear_gradients()
+                    if self.device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    raise RuntimeError(
+                        "FTRAIN ran out of memory during the custom training forward/backward pass. "
+                        "Reduce per_device_batch_size/max_seq_length or increase gradient accumulation."
+                    ) from exc
+                raise
 
-            # ----------------------------------------------------------
-            # Backward
-            # ----------------------------------------------------------
-
-            loss.backward()
-
-            raw_loss_value = _safe_float(
-                raw_loss.detach().item()
-            )
-
-            accumulated_loss += raw_loss_value
-            accumulated_micro_steps += 1
-
-            # ----------------------------------------------------------
-            # Optimizer update
-            # ----------------------------------------------------------
-
-            if (
-                accumulated_micro_steps
-                < current_accumulation
-            ):
+            if accumulated_micro_steps < self._accumulation_target:
                 continue
 
             assert self.optimizer is not None
 
-            # IMPORTANT:
-            # Compute gradient norm and Captain brain activity BEFORE
-            # optimizer.step() and BEFORE zero_grad().
-            grad_norm_tensor = (
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    cfg.max_grad_norm,
-                )
+            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                cfg.max_grad_norm,
             )
-
             latest_grad_norm = _safe_float(
-                grad_norm_tensor.item()
-                if isinstance(
-                    grad_norm_tensor,
-                    torch.Tensor,
-                )
-                else grad_norm_tensor
+                grad_norm_tensor.item() if isinstance(grad_norm_tensor, torch.Tensor) else grad_norm_tensor
             )
 
-            brain_activity = (
-                self._compute_brain_activity()
-            )
-
-            # ----------------------------------------------------------
-            # Captain
-            # ----------------------------------------------------------
-
-            current_lr = self._current_learning_rate()
-
-            if (
-                self.captain is not None
-                and self.step % cfg.captain_interval
-                == cfg.captain_interval - 1
-            ):
-                advice = self.captain.inspect_training(
-                    self.step + 1,
-                    accumulated_loss
-                    / max(
-                        1,
-                        accumulated_micro_steps,
-                    ),
-                    current_lr,
-                    latest_grad_norm,
-                    brain_activity,
-                    latest_val_loss,
-                )
-
-                if advice is not None:
-                    self._apply_captain_advice(
-                        advice
+            if self.captain is not None and self.step % max(1, cfg.captain_interval) == max(1, cfg.captain_interval) - 1:
+                brain_activity = self._compute_brain_activity()
+                current_lr = self._current_learning_rate()
+                try:
+                    advice = self.captain.inspect_training(
+                        self.step + 1,
+                        accumulated_loss / max(1, accumulated_micro_steps),
+                        current_lr,
+                        latest_grad_norm,
+                        brain_activity,
+                        latest_val_loss,
                     )
-
-                    status_message = (
-                        f"{advice.get('action', 'Keep LR')} "
-                        f"(x{_safe_float(advice.get('mult', 1.0), 1.0):.2f})"
-                    )
-
-            # ----------------------------------------------------------
-            # Optimizer / scheduler
-            # ----------------------------------------------------------
+                    if advice:
+                        self._apply_captain_advice(advice)
+                        status_message = (
+                            f"{advice.get('action', 'Keep LR')} "
+                            f"(x{_safe_float(advice.get('mult', 1.0), 1.0):.2f})"
+                        )
+                except Exception:
+                    logger.warning("FTRAIN: Captain inspection failed during training.", exc_info=True)
 
             self.optimizer.step()
-
             if self.scheduler is not None:
                 self.scheduler.step()
-
-            self.optimizer.zero_grad(
-                set_to_none=True
-            )
+            self.optimizer.zero_grad(set_to_none=True)
 
             self.step += 1
 
-            # ----------------------------------------------------------
-            # Metrics
-            # ----------------------------------------------------------
-
-            average_loss = (
-                accumulated_loss
-                / max(
-                    1,
-                    accumulated_micro_steps,
-                )
-            )
-
-            self.loss_history.append(
-                average_loss
-            )
-
+            average_loss = accumulated_loss / max(1, accumulated_micro_steps)
+            self.loss_history.append(average_loss)
             self._last_loss = average_loss
-            latest_lr = self._current_learning_rate()
+            self.lr_history.append(self._current_learning_rate())
 
-            # ----------------------------------------------------------
-            # Evaluation
-            # ----------------------------------------------------------
-
-            if (
-                cfg.eval_interval > 0
-                and self.step % cfg.eval_interval == 0
-                and self.val_dataset is not None
-            ):
+            if cfg.eval_interval > 0 and self.step % cfg.eval_interval == 0 and self.val_dataset is not None:
                 latest_val_loss = self.validate()
-
-            # ----------------------------------------------------------
-            # UI / dashboard
-            # ----------------------------------------------------------
 
             ui.print_train_table(
                 self.step,
                 self.total_steps,
                 average_loss,
                 latest_val_loss,
-                latest_lr,
+                self._current_learning_rate(),
                 latest_grad_norm,
                 status_message,
             )
@@ -2316,909 +1693,269 @@ class Ftrain:
                     self.dashboard.log_metric(
                         self.step,
                         average_loss,
-                        latest_lr,
+                        self._current_learning_rate(),
                         latest_val_loss,
                     )
                 except Exception:
-                    logger.warning(
-                        "FTRAIN: dashboard metric logging failed.",
-                        exc_info=True,
-                    )
+                    logger.debug("FTRAIN: dashboard metric logging failed.", exc_info=True)
 
-            # ----------------------------------------------------------
-            # Checkpoint
-            # ----------------------------------------------------------
-
-            if (
-                cfg.checkpoint_interval > 0
-                and self.step % cfg.checkpoint_interval == 0
-            ):
-                self.save_checkpoint(
-                    self.step
-                )
+            if cfg.checkpoint_interval > 0 and self.step % cfg.checkpoint_interval == 0:
+                self.save_checkpoint(self.step)
 
             accumulated_loss = 0.0
             accumulated_micro_steps = 0
 
-        self.save_checkpoint(
-            self.step,
-            final=True,
-        )
-
-        ui.print_final_summary(
-            {
-                "Model": cfg.model_name,
-                "Steps": self.step,
-                "Loss": (
-                    f"{self._last_loss:.4f}"
-                    if self._last_loss is not None
-                    else "N/A"
-                ),
-                "Dir": cfg.output_dir,
-            }
-        )
-
-        return self.model
-
-    # =========================================================================
-    # Captain / optimizer interaction
-    # =========================================================================
-
-    def _apply_captain_advice(
-        self,
-        advice: Mapping[str, Any],
-    ) -> None:
-        """
-        Store Captain state.
-
-        The custom scheduler reads these values when constructing LR factors.
-        This is intentionally kept separate from direct optimizer mutation so
-        we do not create two competing LR controllers.
-        """
-        multiplier = _safe_float(
-            advice.get(
-                "mult",
-                1.0,
-            ),
-            1.0,
-        )
-
-        low = _safe_float(
-            self.config.captain_mult_min,
-            0.25,
-        )
-
-        high = _safe_float(
-            self.config.captain_mult_max,
-            2.5,
-        )
-
-        multiplier = max(
-            low,
-            min(
-                high,
-                multiplier,
-            ),
-        )
-
-        self._captain_mult = multiplier
-
-        layer = str(
-            advice.get(
-                "layer_boost",
-                "none",
-            )
-        ).strip().lower()
-
-        boost = _safe_float(
-            self.config.captain_layer_boost,
-            2.0,
-        )
-
-        self._captain_layer_boosts = {
-            group: 1.0
-            for group in self._captain_layer_boosts
-        }
-
-        if layer == "all":
-            self._captain_layer_boosts = {
-                group: boost
-                for group in self._captain_layer_boosts
-            }
-
-        elif layer in self._captain_layer_boosts:
-            self._captain_layer_boosts[
-                layer
-            ] = boost
-
-    # =========================================================================
-    # Scheduler
-    # =========================================================================
-
-    def _build_sched(self) -> Any:
-        """
-        Build the custom scheduler.
-
-        Captain scaling is represented inside LambdaLR rather than manually
-        changing optimizer LR from two different places.
-        """
-        cfg = self.config
-
-        if self.optimizer is None:
-            raise RuntimeError(
-                "Cannot build scheduler before optimizer."
-            )
-
-        total_steps = max(
-            1,
-            self.total_steps,
-        )
-
-        warmup = (
-            cfg.warmup_steps
-            if cfg.warmup_steps > 0
-            else int(
-                cfg.warmup_ratio
-                * total_steps
-            )
-        )
-
-        warmup = max(
-            0,
-            min(
-                warmup,
-                total_steps,
-            ),
-        )
-
-        if cfg.use_cosine_restarts:
-            self.scheduler = cosine_restart_scheduler(
-                self.optimizer,
-                cfg.learning_rate,
-                cfg.learning_rate
-                * cfg.min_lr_ratio,
-                warmup,
-                total_steps,
-                cfg.restart_interval,
-            )
-
-            return self.scheduler
-
-        lr_lambdas = []
-
-        for parameter_group in self.optimizer.param_groups:
-            group_name = parameter_group.get(
-                "name",
-                "other",
-            )
-
-            def make_lambda(
-                name: str,
-            ):
-                def lr_lambda(
-                    current_step: int,
-                ) -> float:
-                    if current_step < warmup:
-                        base_factor = (
-                            current_step
-                            / max(
-                                1,
-                                warmup,
-                            )
-                        )
-
-                    else:
-                        progress = min(
-                            1.0,
-                            max(
-                                0.0,
-                                (
-                                    current_step
-                                    - warmup
-                                )
-                                / max(
-                                    1,
-                                    total_steps
-                                    - warmup,
-                                ),
-                            ),
-                        )
-
-                        base_factor = (
-                            cfg.min_lr_ratio
-                            + (
-                                1.0
-                                - cfg.min_lr_ratio
-                            )
-                            * 0.5
-                            * (
-                                1.0
-                                + math.cos(
-                                    math.pi
-                                    * progress
-                                )
-                            )
-                        )
-
-                    captain_factor = (
-                        self._captain_mult
-                    )
-
-                    layer_factor = (
-                        self._captain_layer_boosts.get(
-                            name,
-                            1.0,
-                        )
-                    )
-
-                    return (
-                        base_factor
-                        * captain_factor
-                        * layer_factor
-                    )
-
-                return lr_lambda
-
-            lr_lambdas.append(
-                make_lambda(
-                    group_name
-                )
-            )
-
-        self.scheduler = (
-            torch.optim.lr_scheduler.LambdaLR(
-                self.optimizer,
-                lr_lambdas,
-            )
-        )
-
-        return self.scheduler
-
-    # =========================================================================
-    # Dataloader
-    # =========================================================================
-
-    def _dataloader(
-        self,
-        dataset: Any,
-        shuffle: bool = True,
-    ) -> DataLoader:
-        """Construct the FTRAIN dataloader."""
-        if dataset is None:
-            raise ValueError(
-                "Cannot create DataLoader from None."
-            )
-
-        lengths = getattr(
-            dataset,
-            "lengths",
-            None,
-        )
-
-        if lengths is None:
-            # Fallback to sequential/random sampling when Dataset does not
-            # expose the optimized FTRAIN length metadata.
-            generator = torch.Generator()
-
-            generator.manual_seed(
-                self.config.seed
-                + self.epoch
-            )
-
-            return DataLoader(
-                dataset,
-                batch_size=(
-                    self.config.per_device_batch_size
-                ),
-                shuffle=shuffle,
-                collate_fn=partial(
-                    collate,
-                    pad_token_id=(
-                        self.tokenizer.pad_token_id
-                        or 0
-                    ),
-                ),
-                num_workers=self.config.dataloader_num_workers,
-                pin_memory=(
-                    self.config.pin_memory
-                    and self.device.type == "cuda"
-                ),
-                generator=generator,
-            )
-
-        sampler = LengthSampler(
-            lengths,
-            self.config.per_device_batch_size,
-            shuffle,
-            self.config.seed
-            + self.epoch,
-        )
-
-        return DataLoader(
-            dataset,
-            batch_size=self.config.per_device_batch_size,
-            sampler=sampler,
-            collate_fn=partial(
-                collate,
-                pad_token_id=(
-                    self.tokenizer.pad_token_id
-                    or 0
-                ),
-            ),
-            num_workers=self.config.dataloader_num_workers,
-            pin_memory=(
-                self.config.pin_memory
-                and self.device.type == "cuda"
-            ),
-        )
-
-    # =========================================================================
-    # Validation
-    # =========================================================================
-
-    def validate(self) -> Optional[float]:
-        """Evaluate average validation loss without modifying training state."""
-        if self.val_dataset is None:
-            return None
-
-        if self.model is None:
-            return None
-
-        was_training = self.model.training
-
-        self.model.eval()
-
-        total_loss = 0.0
-        batch_count = 0
-
-        try:
-            loader = self._dataloader(
-                self.val_dataset,
-                shuffle=False,
-            )
-
-            with torch.inference_mode():
-                for batch in loader:
-                    input_ids = self._move_to_device(
-                        batch.get(
-                            "input_ids"
-                        )
-                    )
-
-                    if input_ids is None:
-                        continue
-
-                    attention_mask = batch.get(
-                        "attention_mask"
-                    )
-
-                    if attention_mask is None:
-                        attention_mask = (
-                            torch.ones_like(
-                                input_ids
-                            )
-                        )
-
-                    else:
-                        attention_mask = (
-                            self._move_to_device(
-                                attention_mask
-                            )
-                        )
-
-                    labels = batch.get(
-                        "labels"
-                    )
-
-                    if labels is None:
-                        labels = input_ids
-
-                    else:
-                        labels = self._move_to_device(
-                            labels
-                        )
-
-                    with self._autocast_context():
-                        output = self.model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            labels=labels,
-                        )
-
-                    if output.loss is None:
-                        continue
-
-                    loss = _safe_float(
-                        output.loss.item()
-                    )
-
-                    if not math.isfinite(loss):
-                        logger.warning(
-                            "FTRAIN: non-finite validation loss ignored."
-                        )
-                        continue
-
-                    total_loss += loss
-                    batch_count += 1
-
-            result = (
-                total_loss
-                / max(
-                    1,
-                    batch_count,
-                )
-            )
-
-            self._last_val_loss = result
-
-            return result
-
-        finally:
-            if was_training:
-                self.model.train()
+        self.save_checkpoint(self.step, final=True)
+        return self._finalize_model(self.model, mode="SFT")
 
     # =========================================================================
     # Checkpointing
     # =========================================================================
 
-    def save_checkpoint(
-        self,
-        step: int,
-        final: bool = False,
-    ) -> str:
-        """
-        Save model, tokenizer and training state.
-
-        Unlike the original implementation, optimizer/scheduler state and
-        runtime metadata are also persisted so resume can actually restore the
-        training process rather than merely reload model weights.
-        """
+    def save_checkpoint(self, step: int, final: bool = False) -> str:
         if self.model is None:
-            raise RuntimeError(
-                "Cannot checkpoint without a model."
-            )
+            raise RuntimeError("Cannot checkpoint without a model.")
 
-        cfg = self.config
-
-        tag = (
-            "final"
-            if final
-            else f"step_{int(step)}"
-        )
-
-        root = (
-            Path(cfg.output_dir).expanduser()
-            / "checkpoints"
-        )
-
+        tag = "final" if final else f"step_{int(step)}"
+        root = Path(self.config.output_dir).expanduser() / "checkpoints"
         path = root / tag
 
         with self._checkpoint_lock:
-            path.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            self.model.save_pretrained(
-                str(path)
-            )
-
+            path.mkdir(parents=True, exist_ok=True)
+            self.model.save_pretrained(str(path))
             if self.tokenizer is not None:
-                self.tokenizer.save_pretrained(
-                    str(path)
-                )
-
-            # -----------------------------------------------------------
-            # Optimizer / scheduler state
-            # -----------------------------------------------------------
+                self.tokenizer.save_pretrained(str(path))
 
             if self.optimizer is not None:
-                torch.save(
-                    self.optimizer.state_dict(),
-                    path / "optimizer.pt",
-                )
-
+                torch.save(self.optimizer.state_dict(), path / "optimizer.pt")
             if self.scheduler is not None:
                 try:
-                    torch.save(
-                        self.scheduler.state_dict(),
-                        path / "scheduler.pt",
-                    )
+                    torch.save(self.scheduler.state_dict(), path / "scheduler.pt")
                 except Exception:
-                    logger.warning(
-                        "FTRAIN: scheduler state could not be serialized.",
-                        exc_info=True,
-                    )
-
-            # -----------------------------------------------------------
-            # FTRAIN runtime state
-            # -----------------------------------------------------------
+                    logger.debug("FTRAIN: scheduler state save failed.", exc_info=True)
 
             runtime_state = {
-                "version": "core-v2",
+                "version": "core-v4",
                 "step": int(self.step),
                 "epoch": int(self.epoch),
-                "loss_history": list(
-                    self.loss_history[-1000:]
-                ),
+                "loss_history": list(self.loss_history[-2000:]),
+                "val_loss_history": list(self.val_loss_history[-500:]),
+                "lr_history": list(self.lr_history[-500:]),
                 "last_loss": self._last_loss,
                 "last_val_loss": self._last_val_loss,
+                "best_val_loss": self._best_val_loss,
                 "captain_mult": self._captain_mult,
-                "captain_layer_boosts": dict(
-                    self._captain_layer_boosts
-                ),
-                "current_accumulation_steps": (
-                    self._current_accumulation_steps
-                ),
-                "model_name": cfg.model_name,
+                "captain_layer_boosts": dict(self._captain_layer_boosts),
+                "current_accumulation_steps": self._current_accumulation_steps,
+                "model_name": self.config.model_name,
                 "family": self.family,
             }
-
-            with (
-                path / "ftrain_state.json"
-            ).open(
-                "w",
-                encoding="utf-8",
-            ) as file:
-                json.dump(
-                    runtime_state,
-                    file,
-                    indent=2,
-                    ensure_ascii=False,
-                )
+            with (path / "ftrain_state.json").open("w", encoding="utf-8") as file:
+                json.dump(runtime_state, file, indent=2, ensure_ascii=False)
                 file.write("\n")
 
-            # -----------------------------------------------------------
-            # Checkpoint retention
-            # -----------------------------------------------------------
-
             if not final:
-                self._prune_checkpoints(
-                    root
-                )
+                self._prune_checkpoints(root)
 
-            print(
-                f"💾 checkpoint → {path}"
-            )
-
+        logger.info("FTRAIN checkpoint saved: %s", path)
+        print(f"💾 checkpoint → {path}")
         return str(path)
 
-    def _prune_checkpoints(
-        self,
-        checkpoint_root: Path,
-    ) -> None:
-        """Remove oldest step checkpoints according to save_total_limit."""
+    def _prune_checkpoints(self, checkpoint_root: Path) -> None:
+        limit = max(1, int(self.config.save_total_limit))
         candidates: List[Tuple[int, Path]] = []
-
         for entry in checkpoint_root.iterdir():
             if not entry.is_dir():
                 continue
-
-            match = re.fullmatch(
-                r"step_(\d+)",
-                entry.name,
-            )
-
+            match = re.fullmatch(r"step_(\d+)", entry.name)
             if match:
-                candidates.append(
-                    (
-                        int(
-                            match.group(1)
-                        ),
-                        entry,
-                    )
-                )
-
-        candidates.sort(
-            key=lambda item: item[0]
-        )
-
-        while len(candidates) > self.config.save_total_limit:
+                candidates.append((int(match.group(1)), entry))
+        candidates.sort(key=lambda x: x[0])
+        while len(candidates) > limit:
             _, old_path = candidates.pop(0)
-
             try:
-                shutil.rmtree(
-                    old_path
-                )
+                shutil.rmtree(old_path)
             except OSError:
-                logger.warning(
-                    "FTRAIN: failed to remove old checkpoint %s.",
-                    old_path,
-                    exc_info=True,
-                )
+                logger.debug("FTRAIN: failed to remove checkpoint %s", old_path, exc_info=True)
 
-    # =========================================================================
-    # Resume state
-    # =========================================================================
-
-    def load_training_state(
-        self,
-        checkpoint: Optional[str] = None,
-    ) -> bool:
-        """
-        Restore optimizer/scheduler/FTRAIN state from a checkpoint.
-
-        Model weights are normally loaded by the Trainer/model loader itself;
-        this method restores the training-specific state.
-        """
+    def load_training_state(self, checkpoint: Optional[str] = None) -> bool:
         checkpoint_path = Path(
-            checkpoint
-            or self.config.resume_from_checkpoint
-            or ""
+            checkpoint or self.config.resume_from_checkpoint or ""
         ).expanduser()
-
         if not checkpoint_path.is_dir():
             return False
 
-        state_file = (
-            checkpoint_path
-            / "ftrain_state.json"
-        )
-
+        state_file = checkpoint_path / "ftrain_state.json"
         if state_file.exists():
             try:
-                with state_file.open(
-                    "r",
-                    encoding="utf-8",
-                ) as file:
+                with state_file.open("r", encoding="utf-8") as file:
                     state = json.load(file)
-
-                self.step = max(
-                    0,
-                    _safe_int(
-                        state.get(
-                            "step",
-                            0,
-                        )
-                    ),
+                self.step = max(0, _safe_int(state.get("step", 0)))
+                self.epoch = max(0, _safe_int(state.get("epoch", 0)))
+                self.loss_history = [
+                    _safe_float(v)
+                    for v in state.get("loss_history", [])
+                    if _is_finite(v)
+                ]
+                self.val_loss_history = [
+                    _safe_float(v)
+                    for v in state.get("val_loss_history", [])
+                    if _is_finite(v)
+                ]
+                self.lr_history = [
+                    _safe_float(v)
+                    for v in state.get("lr_history", [])
+                    if _is_finite(v)
+                ]
+                self._last_loss = state.get("last_loss")
+                self._last_val_loss = state.get("last_val_loss")
+                self._best_val_loss = state.get("best_val_loss")
+                self._captain_mult = _safe_float(state.get("captain_mult", 1.0), 1.0)
+                boosts = state.get("captain_layer_boosts", {})
+                if isinstance(boosts, Mapping):
+                    for name in self._captain_layer_boosts:
+                        self._captain_layer_boosts[name] = _safe_float(boosts.get(name, 1.0), 1.0)
+                self._current_accumulation_steps = max(
+                    1,
+                    _safe_int(state.get("current_accumulation_steps", 1), 1),
                 )
-
-                self.epoch = max(
-                    0,
-                    _safe_int(
-                        state.get(
-                            "epoch",
-                            0,
-                        )
-                    ),
-                )
-
-                loss_history = state.get(
-                    "loss_history",
-                    [],
-                )
-
-                if isinstance(
-                    loss_history,
-                    list,
-                ):
-                    self.loss_history = [
-                        _safe_float(value)
-                        for value in loss_history
-                        if _is_finite(value)
-                    ]
-
-                self._last_loss = state.get(
-                    "last_loss"
-                )
-
-                self._last_val_loss = state.get(
-                    "last_val_loss"
-                )
-
-                self._captain_mult = _safe_float(
-                    state.get(
-                        "captain_mult",
-                        1.0,
-                    ),
-                    1.0,
-                )
-
-                boosts = state.get(
-                    "captain_layer_boosts",
-                    {},
-                )
-
-                if isinstance(
-                    boosts,
-                    Mapping,
-                ):
-                    for key in self._captain_layer_boosts:
-                        self._captain_layer_boosts[
-                            key
-                        ] = _safe_float(
-                            boosts.get(
-                                key,
-                                1.0,
-                            ),
-                            1.0,
-                        )
-
             except Exception:
-                logger.warning(
-                    "FTRAIN: checkpoint runtime state could not be restored.",
-                    exc_info=True,
-                )
+                logger.warning("FTRAIN: runtime state restore failed.", exc_info=True)
 
-        optimizer_file = (
-            checkpoint_path
-            / "optimizer.pt"
-        )
-
-        if (
-            optimizer_file.exists()
-            and self.optimizer is not None
-        ):
+        optimizer_file = checkpoint_path / "optimizer.pt"
+        if optimizer_file.exists() and self.optimizer is not None:
             try:
-                state_dict = torch.load(
-                    optimizer_file,
-                    map_location=self.device,
-                )
-
-                self.optimizer.load_state_dict(
-                    state_dict
-                )
-
+                state = torch.load(optimizer_file, map_location="cpu")
+                self.optimizer.load_state_dict(state)
+                self._optimizer_state_to_device()
             except Exception:
-                logger.warning(
-                    "FTRAIN: optimizer state could not be restored.",
-                    exc_info=True,
-                )
+                logger.warning("FTRAIN: optimizer state restore failed.", exc_info=True)
 
-        scheduler_file = (
-            checkpoint_path
-            / "scheduler.pt"
-        )
-
-        if (
-            scheduler_file.exists()
-            and self.scheduler is not None
-        ):
+        scheduler_file = checkpoint_path / "scheduler.pt"
+        if scheduler_file.exists() and self.scheduler is not None:
             try:
-                state_dict = torch.load(
-                    scheduler_file,
-                    map_location="cpu",
-                )
-
-                self.scheduler.load_state_dict(
-                    state_dict
-                )
-
+                state = torch.load(scheduler_file, map_location="cpu")
+                self.scheduler.load_state_dict(state)
             except Exception:
-                logger.warning(
-                    "FTRAIN: scheduler state could not be restored.",
-                    exc_info=True,
-                )
+                logger.warning("FTRAIN: scheduler state restore failed.", exc_info=True)
 
         return True
+
+    def _optimizer_state_to_device(self) -> None:
+        if self.optimizer is None:
+            return
+        for state in self.optimizer.state.values():
+            for key, value in list(state.items()):
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(self.device)
 
     # =========================================================================
     # Finalization
     # =========================================================================
 
-    def _finalize_model(
-        self,
-        model: torch.nn.Module,
-        mode: str,
-    ) -> torch.nn.Module:
-        """Save final model and produce the standard FTRAIN summary."""
+    def _finalize_model(self, model: torch.nn.Module, mode: str) -> torch.nn.Module:
+        """Export the final model once and persist final runtime metadata."""
         self.model = model
+        final_path = Path(self.config.output_dir).expanduser() / "final"
+        final_path.mkdir(parents=True, exist_ok=True)
 
-        final_path = (
-            Path(
-                self.config.output_dir
-            ).expanduser()
-            / "final"
-        )
-
-        final_path.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        self.model.save_pretrained(
-            str(final_path)
-        )
-
+        self.model.save_pretrained(str(final_path))
         if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(
-                str(final_path)
-            )
+            self.tokenizer.save_pretrained(str(final_path))
 
-        # Also maintain FTRAIN's checkpoint structure.
-        self.save_checkpoint(
-            self.step,
-            final=True,
-        )
+        final_state = {
+            "version": "core-v4",
+            "step": int(self.step),
+            "epoch": int(self.epoch),
+            "mode": mode,
+            "loss_history": list(self.loss_history[-2000:]),
+            "val_loss_history": list(self.val_loss_history[-500:]),
+            "lr_history": list(self.lr_history[-500:]),
+            "last_loss": self._last_loss,
+            "last_val_loss": self._last_val_loss,
+            "best_val_loss": self._best_val_loss,
+            "skipped_steps": int(self._skipped_steps),
+            "captain_mult": float(self._captain_mult),
+            "captain_layer_boosts": dict(self._captain_layer_boosts),
+            "current_accumulation_steps": int(self._current_accumulation_steps),
+            "model_name": self.config.model_name,
+            "family": self.family,
+        }
+
+        try:
+            with (final_path / "ftrain_final_state.json").open("w", encoding="utf-8") as file:
+                json.dump(final_state, file, indent=2, ensure_ascii=False)
+                file.write("\n")
+        except Exception:
+            logger.warning("FTRAIN: final runtime state save failed.", exc_info=True)
+
+        try:
+            if self.optimizer is not None:
+                torch.save(self.optimizer.state_dict(), final_path / "optimizer.pt")
+            if self.scheduler is not None:
+                torch.save(self.scheduler.state_dict(), final_path / "scheduler.pt")
+        except Exception:
+            logger.warning("FTRAIN: final optimizer/scheduler state save failed.", exc_info=True)
 
         ui.print_final_summary(
             {
                 "Model": self.config.model_name,
-                "Steps": self.total_steps,
+                "Steps": self.step,
                 "Mode": mode,
+                "Final Loss": (
+                    f"{self._last_loss:.4f}" if self._last_loss is not None else "N/A"
+                ),
+                "Validation Loss": (
+                    f"{self._last_val_loss:.4f}" if self._last_val_loss is not None else "N/A"
+                ),
+                "Best Validation Loss": (
+                    f"{self._best_val_loss:.4f}" if self._best_val_loss is not None else "N/A"
+                ),
+                "Skipped Steps": self._skipped_steps,
                 "Dir": str(final_path),
             }
         )
-
         return self.model
 
     # =========================================================================
     # Device helpers
     # =========================================================================
 
-    def _move_to_device(
-        self,
-        value: Any,
-    ) -> Any:
-        """Move tensors recursively to the engine device."""
+    def _move_to_device(self, value: Any) -> Any:
         if value is None:
             return None
-
-        if isinstance(
-            value,
-            torch.Tensor,
-        ):
+        if isinstance(value, torch.Tensor):
             return value.to(
                 self.device,
-                non_blocking=(
-                    self.config.pin_memory
-                    and self.device.type == "cuda"
-                ),
+                non_blocking=bool(self.config.pin_memory and self.device.type == "cuda"),
             )
-
-        if isinstance(
-            value,
-            Mapping,
-        ):
-            return {
-                key: self._move_to_device(
-                    item
-                )
-                for key, item in value.items()
-            }
-
-        if isinstance(
-            value,
-            (list, tuple),
-        ):
-            converted = [
-                self._move_to_device(item)
-                for item in value
-            ]
-
-            return (
-                type(value)(converted)
-                if isinstance(
-                    value,
-                    tuple,
-                )
-                else converted
-            )
-
+        if isinstance(value, Mapping):
+            return {key: self._move_to_device(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(self._move_to_device(item) for item in value)
+        if isinstance(value, list):
+            return [self._move_to_device(item) for item in value]
         return value
 
     def _current_learning_rate(self) -> float:
-        """Get a representative current optimizer learning rate."""
         if self.optimizer is None:
-            return float(
-                self.config.learning_rate
-            )
+            return float(self.config.learning_rate)
 
-        values = [
-            _safe_float(
-                group.get(
-                    "lr",
-                    self.config.learning_rate,
-                ),
-                self.config.learning_rate,
-            )
-            for group in self.optimizer.param_groups
-        ]
+        weighted_sum = 0.0
+        total_params = 0
+        fallback = float(self.config.learning_rate)
 
-        return (
-            values[0]
-            if values
-            else float(
-                self.config.learning_rate
-            )
-        )
+        for group in self.optimizer.param_groups:
+            lr = _safe_float(group.get("lr", fallback), fallback)
+            try:
+                count = sum(int(p.numel()) for p in group.get("params", ()))
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+            weighted_sum += lr * count
+            total_params += count
+
+        if total_params <= 0:
+            return fallback
+        return weighted_sum / total_params
