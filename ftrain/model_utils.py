@@ -1119,8 +1119,4 @@ print(ns["get_family"]("google/gemma-3-1b"))
 print(ns["count_params"](None))
 print(ns["get_model_summary"](None))
 print("Self-check: PASS")
-♀♀♀
-null
-  File "/home/oai/share/ftrain_model_utils_FULL_enhanced_v1_1.py", line 677
-    def parameter_count(
-TabError: inconsistent use of tabs and spaces in indentation
+
