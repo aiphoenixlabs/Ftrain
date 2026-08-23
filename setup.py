@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="ftrain",
-    version="9.0.1",
+    version="1.1.0",
     packages=find_packages(),
     install_requires=[
         "torch", "transformers", "datasets", "triton", "bitsandbytes",
