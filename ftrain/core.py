@@ -187,7 +187,17 @@ class Ftrain:
             int(config.max_steps),
         )
 
+        self._distributed = self._detect_distributed_training()
+        self._local_rank = self._resolve_local_rank()
+        self._world_size = self._resolve_world_size()
         self.device = self._resolve_device()
+
+        # Training MUST use one coherent device per process.
+        # Automatic model sharding across cuda:0/cuda:1 is an inference
+        # strategy, not a substitute for DDP. In a normal Kaggle notebook
+        # (world_size=1), FTRAIN therefore pins the whole trainable model to
+        # one GPU. With torchrun/Accelerate, each process uses its local GPU.
+        self._training_device = self.device
 
         self._checkpoint_lock = threading.Lock()
         self._dashboard_started = False
@@ -274,20 +284,133 @@ class Ftrain:
     # Device/runtime
     # =========================================================================
 
+    def _resolve_world_size(self) -> int:
+        """Return the requested distributed world size."""
+        try:
+            return max(1, int(os.environ.get("WORLD_SIZE", "1")))
+        except (TypeError, ValueError):
+            return 1
+
+    def _resolve_local_rank(self) -> int:
+        """Return the current process local rank when distributed training is active."""
+        try:
+            return max(0, int(os.environ.get("LOCAL_RANK", "0")))
+        except (TypeError, ValueError):
+            return 0
+
+    def _detect_distributed_training(self) -> bool:
+        """Detect real multi-process training, not merely multiple visible GPUs."""
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                return dist.get_world_size() > 1
+        except Exception:
+            pass
+        try:
+            return int(os.environ.get("WORLD_SIZE", "1")) > 1
+        except (TypeError, ValueError):
+            return False
+
     def _resolve_device(self) -> torch.device:
+        """Resolve the single device owned by this FTRAIN process.
+
+        FTRAIN never treats ``torch.cuda.device_count() > 1`` as permission
+        to shard a trainable model. In a regular notebook one process owns one
+        GPU (cuda:0). Under torchrun/Accelerate/DDP each process owns its local
+        rank GPU. This prevents the cuda:0-input/cuda:1-embedding failure seen
+        with automatic model dispatch.
+        """
         if torch.cuda.is_available():
-            return torch.device("cuda")
+            try:
+                count = torch.cuda.device_count()
+            except Exception:
+                count = 1
+
+            if self._detect_distributed_training() and count > 1:
+                index = min(self._resolve_local_rank(), count - 1)
+                return torch.device(f"cuda:{index}")
+
+            return torch.device("cuda:0")
 
         if (
-            hasattr(
-                torch.backends,
-                "mps",
-            )
+            hasattr(torch.backends, "mps")
             and torch.backends.mps.is_available()
         ):
             return torch.device("mps")
 
         return torch.device("cpu")
+
+    def _device_map_for_training(self) -> Optional[Dict[str, str]]:
+        """Return a safe single-device map for trainable model loading."""
+        if self.device.type != "cuda":
+            return None
+        return {"": str(self.device)}
+
+    def _is_model_sharded(self) -> bool:
+        """Whether the loaded model spans more than one concrete device."""
+        if self.model is None:
+            return False
+
+        devices = set()
+        try:
+            for parameter in self.model.parameters():
+                devices.add(str(parameter.device))
+                if len(devices) > 1:
+                    return True
+        except Exception:
+            return False
+
+        return False
+
+    def _assert_training_device_coherence(self) -> None:
+        """Fail early with a useful message if a trainable model spans devices."""
+        if self.model is None:
+            raise RuntimeError("FTRAIN training requires a loaded model.")
+
+        devices = set()
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            devices.add(str(parameter.device))
+            if len(devices) > 1:
+                break
+
+        if len(devices) > 1:
+            raise RuntimeError(
+                "FTRAIN detected a trainable model spread across multiple devices "
+                f"({sorted(devices)}). Automatic model sharding is disabled for "
+                "single-process training because it can place input_ids on one "
+                "GPU and embeddings/LoRA weights on another. Launch FTRAIN with "
+                "torchrun/Accelerate for true multi-GPU DDP, or allow FTRAIN to "
+                "pin this notebook process to one GPU."
+            )
+
+        if devices and self.device.type == "cuda":
+            expected = str(self.device)
+            if devices != {expected}:
+                raise RuntimeError(
+                    "FTRAIN device mismatch before training: "
+                    f"trainable parameters are on {sorted(devices)}, but the "
+                    f"training process owns {expected}."
+                )
+
+    def _model_input_device(self) -> torch.device:
+        """Best-effort input device for inference/evaluation."""
+        if self.model is not None:
+            try:
+                embed = self.model.get_input_embeddings()
+                weight = getattr(embed, "weight", None)
+                if isinstance(weight, torch.Tensor):
+                    return weight.device
+            except Exception:
+                pass
+
+            try:
+                return next(self.model.parameters()).device
+            except StopIteration:
+                pass
+
+        return self.device
 
     def _configure_runtime(self) -> None:
         try:
@@ -435,13 +558,13 @@ class Ftrain:
         return torch.float32
 
     def _load_model(self) -> None:
+        """Load a trainable model with explicit single-device placement."""
         cfg = self.config
 
         bar = ui.LoadingBar(
             message=f"Loading {cfg.model_name}",
             real_progress=cfg.show_model_progress,
         )
-
         bar.start()
 
         try:
@@ -452,28 +575,40 @@ class Ftrain:
             }
 
             if not cfg.load_in_4bit:
-                # Newer Unsloth versions may expose dtype while older versions
-                # use torch_dtype internally; only pass the public parameter.
                 kwargs["dtype"] = self._preferred_model_dtype()
 
-            attention_impl = self.preset.get(
-                "attn_implementation"
-            )
-
+            attention_impl = self.preset.get("attn_implementation")
             if attention_impl:
                 kwargs["attn_implementation"] = attention_impl
+
+            # CRITICAL: never ask Unsloth to auto-shard a trainable model.
+            # In a normal notebook this pins the entire model to cuda:0; in
+            # DDP every process gets its own local-rank GPU.
+            device_map = self._device_map_for_training()
+            if device_map is not None:
+                kwargs["device_map"] = device_map
 
             try:
                 with self._quiet_stdout():
                     self.model, self.tokenizer = (
-                        FastLanguageModel.from_pretrained(
-                            **kwargs
-                        )
+                        FastLanguageModel.from_pretrained(**kwargs)
+                    )
+            except TypeError as exc:
+                # Some Unsloth releases don't expose device_map publicly.
+                # Retry without it, then immediately validate placement.
+                logger.warning(
+                    "FTRAIN: Unsloth rejected explicit device_map; retrying "
+                    "without it and validating for unsafe sharding: %s",
+                    exc,
+                )
+                kwargs.pop("device_map", None)
+                with self._quiet_stdout():
+                    self.model, self.tokenizer = (
+                        FastLanguageModel.from_pretrained(**kwargs)
                     )
             except Exception as exc:
                 logger.warning(
-                    "Unsloth model loading failed; "
-                    "falling back to Transformers: %s",
+                    "Unsloth model loading failed; falling back to Transformers: %s",
                     exc,
                 )
                 self._load_model_transformers()
@@ -485,6 +620,7 @@ class Ftrain:
 
             self._prepare_tokenizer()
             self._prepare_model()
+            self._assert_training_device_coherence()
 
         finally:
             bar.done()
@@ -497,10 +633,13 @@ class Ftrain:
 
         kwargs: Dict[str, Any] = {
             "torch_dtype": self._preferred_model_dtype(),
+            "low_cpu_mem_usage": True,
         }
 
+        # NEVER use device_map="auto" for a trainable FTRAIN model.
+        # Auto-sharding is precisely what caused cuda:0/cuda:1 mismatch.
         if self.device.type == "cuda":
-            kwargs["device_map"] = "auto"
+            kwargs["device_map"] = {"": str(self.device)}
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
@@ -508,8 +647,63 @@ class Ftrain:
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model_name
+            self.config.model_name,
         )
+
+    def _prepare_tokenizer(self) -> None:
+        tokenizer = self.tokenizer
+
+        if tokenizer is None:
+            raise RuntimeError(
+                "Tokenizer is unavailable."
+            )
+
+        if getattr(
+            tokenizer,
+            "pad_token_id",
+            None,
+        ) is None:
+            eos_token = getattr(
+                tokenizer,
+                "eos_token",
+                None,
+            )
+
+            if eos_token is not None:
+                tokenizer.pad_token = eos_token
+            else:
+                logger.warning(
+                    "Tokenizer has neither pad_token nor eos_token."
+                )
+
+        try:
+            tokenizer.padding_side = "right"
+        except Exception:
+            pass
+
+    def _prepare_model(self) -> None:
+        if self.model is None:
+            raise RuntimeError(
+                "Model is unavailable."
+            )
+
+        # A correctly loaded training model should already live entirely on
+        # the process device. Only move non-quantized/un-dispatched models.
+        if self._is_model_sharded():
+            self._assert_training_device_coherence()
+            return
+
+        try:
+            self.model.to(self.device)
+        except Exception:
+            # Quantized/bnb models may intentionally reject .to(). In that
+            # case the load-time device_map is authoritative; validate it.
+            logger.debug(
+                "FTRAIN: model .to(device) skipped; validating placement instead.",
+                exc_info=True,
+            )
+
+        self._assert_training_device_coherence()
 
     def _prepare_tokenizer(self) -> None:
         tokenizer = self.tokenizer
@@ -1226,8 +1420,9 @@ class Ftrain:
                 ),
             )
 
+            eval_device = self._model_input_device()
             inputs = {
-                key: value.to(self.device)
+                key: value.to(eval_device)
                 if isinstance(
                     value,
                     torch.Tensor,
@@ -1793,6 +1988,14 @@ class Ftrain:
             requested["bf16"] = False
             requested["fp16"] = False
 
+        # True DDP support: only activate distributed arguments when the
+        # process was actually launched in a multi-process job. A notebook
+        # with two visible GPUs must NOT be treated as DDP automatically.
+        if self._distributed:
+            requested["ddp_find_unused_parameters"] = False
+            requested["ddp_backend"] = "nccl"
+            requested["local_rank"] = self._local_rank
+
         supported = self._supported_parameters(
             argument_class
         )
@@ -2326,6 +2529,9 @@ class Ftrain:
                 f"requested max_steps={cfg.max_steps}, "
                 f"trainer has max_steps={actual_max_steps}."
             )
+
+        # Never enter HF/Unsloth training with an accidentally sharded model.
+        self._assert_training_device_coherence()
 
         logger.info(
             "FTRAIN: starting %s trainer for exactly %s configured max steps.",
