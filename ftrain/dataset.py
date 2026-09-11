@@ -540,7 +540,12 @@ class FtrainDataset(Dataset):
         if len(input_ids) < self.max_len:
             input_ids.append(eos_id)
         else:
-            input_ids[-1] = eos_id
+            # Never overwrite a real token with EOS: doing so corrupts the
+            # final answer token the model is being taught to predict.
+            # Drop the oldest-truncated token instead and keep the answer's
+            # last token intact, then append EOS.
+            input_ids = input_ids[: self.max_len - 1]
+            input_ids.append(eos_id)
 
         return input_ids[:self.max_len]
 
