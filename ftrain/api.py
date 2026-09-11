@@ -105,6 +105,20 @@ def _validate_validation_ratio(ratio: float) -> float:
     return ratio
 
 
+def _validate_bool_flag(value: Any, argument_name: str) -> bool:
+    """Strict boolean validation for public API flags."""
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return False
+
+    raise TypeError(
+        f"'{argument_name}' must be a boolean (True/False), "
+        f"got {type(value).__name__}."
+    )
+
+
 def _split_data(
     data: Any,
     validation_ratio: float = 0.10,
@@ -190,6 +204,7 @@ def _build_train_config(
     answer: str,
     output_dir: str,
     extra_kwargs: Mapping[str, Any],
+    maximum_power: bool = False,
 ) -> TrainConfig:
     """
     Construct TrainConfig while preventing duplicate keyword collisions.
@@ -207,6 +222,7 @@ def _build_train_config(
         "answer_mode",
         "captain_mode",
         "output_dir",
+        "maximum_power",
     }
 
     for key in reserved:
@@ -220,6 +236,7 @@ def _build_train_config(
             "answer_mode": answer,
             "captain_mode": "llm" if captain else "rule",
             "output_dir": output_dir,
+            "maximum_power": bool(maximum_power),
         }
     )
 
@@ -240,6 +257,7 @@ def _build_merge_config(
     captain: Optional[str],
     output_dir: str,
     extra_kwargs: Mapping[str, Any],
+    maximum_power: bool = False,
 ) -> MergeConfig:
     """
     Construct MergeConfig while preventing duplicate keyword collisions.
@@ -251,6 +269,7 @@ def _build_merge_config(
         "model_b",
         "captain_model",
         "output_dir",
+        "maximum_power",
     }
 
     for key in reserved:
@@ -262,6 +281,7 @@ def _build_merge_config(
             "model_b": model_b,
             "captain_model": captain,
             "output_dir": output_dir,
+            "maximum_power": bool(maximum_power),
         }
     )
 
@@ -299,6 +319,7 @@ class train:
         Steps: int = 100,
         Captain: Optional[str] = None,
         Answer: str = "auto_yes",
+        MaximumPower: bool = False,
         **kwargs: Any,
     ) -> Any:
         """
@@ -356,6 +377,14 @@ class train:
             captain = None
 
         runtime_kwargs: Dict[str, Any] = dict(kwargs)
+
+        # Accept both spellings; the explicit named argument wins.
+        if MaximumPower is None:
+            MaximumPower = runtime_kwargs.pop("maximum_power", False)
+        else:
+            runtime_kwargs.pop("maximum_power", None)
+
+        maximum_power = _validate_bool_flag(MaximumPower, "MaximumPower")
 
         output_dir = runtime_kwargs.pop(
             "output_dir",
@@ -416,6 +445,7 @@ class train:
             answer=answer,
             output_dir=output_dir,
             extra_kwargs=runtime_kwargs,
+            maximum_power=maximum_power,
         )
 
         engine = Ftrain(
@@ -456,6 +486,7 @@ class merge:
         First: Optional[str] = None,
         Second: Optional[str] = None,
         Captain: Optional[str] = None,
+        MaximumPower: bool = False,
         **kwargs: Any,
     ) -> Any:
         """
@@ -493,6 +524,14 @@ class merge:
             captain = _validate_model_name(Captain, "Captain")
         else:
             captain = None
+
+        # Accept both spellings; the explicit named argument wins.
+        if MaximumPower is None:
+            MaximumPower = runtime_kwargs.pop("maximum_power", False)
+        else:
+            runtime_kwargs.pop("maximum_power", None)
+
+        maximum_power = _validate_bool_flag(MaximumPower, "MaximumPower")
 
         # Avoid accidentally merging a model with itself unless the caller
         # explicitly disables the check via allow_self_merge=True.
@@ -541,6 +580,7 @@ class merge:
             captain=captain,
             output_dir=output_dir,
             extra_kwargs=runtime_kwargs,
+            maximum_power=maximum_power,
         )
 
         merger = Merger(config)
