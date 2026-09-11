@@ -20,7 +20,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import torch
 from torch.utils.data import DataLoader
 
-from unsloth import FastLanguageModel
+try:
+    from unsloth import FastLanguageModel
+    UNSLOTH_AVAILABLE = True
+except Exception:  # platform-dependent: Mac/AMD/Intel/CPU have no unsloth
+    FastLanguageModel = None
+    UNSLOTH_AVAILABLE = False
 
 from . import ui
 from .captain import PhoenixCaptain
@@ -127,6 +132,16 @@ class Ftrain:
         self.config = config
         self.train_data = train_data
         self.val_data = val_data
+
+        # ------------------------------------------------------------------
+        # Multi-GPU: join the process group when launched with torchrun.
+        # Must happen before device resolution reads LOCAL_RANK.
+        # ------------------------------------------------------------------
+
+        from .distributed import DDPInfo, init_distributed_if_needed
+
+        self._ddp: DDPInfo = init_distributed_if_needed()
+        self._model_ddp: Optional[torch.nn.Module] = None
 
         # ------------------------------------------------------------------
         # Persistent runtime state
@@ -331,6 +346,20 @@ class Ftrain:
                 return torch.device(f"cuda:{index}")
 
             return torch.device("cuda:0")
+
+        if (
+            hasattr(torch, "xpu")
+            and torch.xpu.is_available()
+        ):
+            return torch.device("xpu", 0)
+
+        try:
+            import torch_directml  # type: ignore
+
+            if torch_directml.device_count() > 0:
+                return torch_directml.device()
+        except Exception:
+            pass
 
         if (
             hasattr(torch.backends, "mps")
@@ -555,6 +584,17 @@ class Ftrain:
                 pass
             return torch.float16
 
+        if self.device.type == "xpu":
+            try:
+                if torch.xpu.is_bf16_supported():
+                    return torch.bfloat16
+            except Exception:
+                pass
+            return torch.float16
+
+        if self.device.type == "mps":
+            return torch.float16
+
         return torch.float32
 
     def _load_model(self) -> None:
@@ -588,30 +628,40 @@ class Ftrain:
             if device_map is not None:
                 kwargs["device_map"] = device_map
 
-            try:
-                with self._quiet_stdout():
-                    self.model, self.tokenizer = (
-                        FastLanguageModel.from_pretrained(**kwargs)
-                    )
-            except TypeError as exc:
-                # Some Unsloth releases don't expose device_map publicly.
-                # Retry without it, then immediately validate placement.
-                logger.warning(
-                    "FTRAIN: Unsloth rejected explicit device_map; retrying "
-                    "without it and validating for unsafe sharding: %s",
-                    exc,
-                )
-                kwargs.pop("device_map", None)
-                with self._quiet_stdout():
-                    self.model, self.tokenizer = (
-                        FastLanguageModel.from_pretrained(**kwargs)
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "Unsloth model loading failed; falling back to Transformers: %s",
-                    exc,
+            if FastLanguageModel is None:
+                # Mac (MPS), AMD ROCm, Intel XPU, DirectML and plain-CPU
+                # hosts have no unsloth; the Transformers loader is the
+                # portable path.
+                logger.info(
+                    "unsloth is not available on this platform; "
+                    "loading with Transformers."
                 )
                 self._load_model_transformers()
+            else:
+                try:
+                    with self._quiet_stdout():
+                        self.model, self.tokenizer = (
+                            FastLanguageModel.from_pretrained(**kwargs)
+                        )
+                except TypeError as exc:
+                    # Some Unsloth releases don't expose device_map publicly.
+                    # Retry without it, then immediately validate placement.
+                    logger.warning(
+                        "FTRAIN: Unsloth rejected explicit device_map; retrying "
+                        "without it and validating for unsafe sharding: %s",
+                        exc,
+                    )
+                    kwargs.pop("device_map", None)
+                    with self._quiet_stdout():
+                        self.model, self.tokenizer = (
+                            FastLanguageModel.from_pretrained(**kwargs)
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Unsloth model loading failed; falling back to Transformers: %s",
+                        exc,
+                    )
+                    self._load_model_transformers()
 
             if self.model is None or self.tokenizer is None:
                 raise RuntimeError(
@@ -2575,6 +2625,27 @@ class Ftrain:
                 cfg.resume_from_checkpoint
             )
 
+        # ------------------------------------------------------------------
+        # Multi-GPU: wrap AFTER resume so checkpoint weights load into the
+        # raw module first. DDP syncs gradients from the same parameters,
+        # and with LoRA-only training every trainable param gets a gradient,
+        # keeping find_unused_parameters=False safe and fast.
+        # ------------------------------------------------------------------
+
+        if self._ddp.enabled:
+            from .distributed import wrap_ddp
+
+            self._model_ddp = wrap_ddp(
+                self.model,
+                self._ddp,
+            )
+
+            if self._model_ddp is not self.model:
+                logger.info(
+                    "FTRAIN distributed: %s",
+                    self._ddp.summary(),
+                )
+
         loader = self._dataloader(
             self.train_dataset,
             shuffle=True,
@@ -2691,9 +2762,15 @@ class Ftrain:
             if labels is None:
                 labels = input_ids
 
+            training_model = (
+                self._model_ddp
+                if self._model_ddp is not None
+                else self.model
+            )
+
             try:
                 with self._autocast_context():
-                    output = self.model(
+                    output = training_model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         labels=labels,
@@ -2725,12 +2802,32 @@ class Ftrain:
                     / self._accumulation_target
                 )
 
-                if scaler is not None:
-                    scaler.scale(
-                        loss
-                    ).backward()
+                # Multi-GPU: skip the gradient all-reduce on non-final
+                # micro-steps — the difference between DDP that scales
+                # and DDP that burns N× the bandwidth per optimizer step.
+                is_last_micro = (
+                    accumulated_micro_steps + 1
+                    >= self._accumulation_target
+                )
+
+                if (
+                    self._model_ddp is not None
+                    and not is_last_micro
+                ):
+                    with self._model_ddp.no_sync():
+                        if scaler is not None:
+                            scaler.scale(
+                                loss
+                            ).backward()
+                        else:
+                            loss.backward()
                 else:
-                    loss.backward()
+                    if scaler is not None:
+                        scaler.scale(
+                            loss
+                        ).backward()
+                    else:
+                        loss.backward()
 
                 accumulated_loss += _safe_float(
                     raw_loss.detach().item()
@@ -2784,6 +2881,7 @@ class Ftrain:
 
             if (
                 self.captain is not None
+                and self._ddp.is_main
                 and (
                     self.step
                     % max(
@@ -2829,6 +2927,27 @@ class Ftrain:
                         exc_info=True,
                     )
 
+            # Multi-GPU: the Captain decision must be identical on every
+            # rank, otherwise LRs diverge and weights desync. Rank 0
+            # decides (possibly 1.0); everyone obeys the broadcast.
+            if self._ddp.enabled and (
+                self.step
+                % max(1, cfg.captain_interval)
+                == max(1, cfg.captain_interval) - 1
+            ):
+                from .distributed import broadcast_float
+
+                self._captain_mult = broadcast_float(
+                    self._captain_mult,
+                    self._ddp,
+                )
+
+                if not self._ddp.is_main:
+                    self._captain_layer_boosts = {
+                        key: 1.0
+                        for key in self._captain_layer_boosts
+                    }
+
             if scaler is not None:
                 scaler.step(
                     self.optimizer
@@ -2854,6 +2973,14 @@ class Ftrain:
                 )
             )
 
+            if self._ddp.enabled:
+                from .distributed import all_reduce_mean
+
+                average_loss = all_reduce_mean(
+                    average_loss,
+                    self._ddp,
+                )
+
             self.loss_history.append(
                 average_loss
             )
@@ -2877,35 +3004,38 @@ class Ftrain:
                 and self.val_dataset is not None
             ):
                 latest_val_loss = self.validate()
+                self._on_validation(self.step, latest_val_loss)
 
-            ui.print_train_table(
-                self.step,
-                self.total_steps,
-                average_loss,
-                latest_val_loss,
-                latest_lr,
-                latest_grad_norm,
-                status_message,
-            )
+            if self._ddp.is_main:
+                ui.print_train_table(
+                    self.step,
+                    self.total_steps,
+                    average_loss,
+                    latest_val_loss,
+                    latest_lr,
+                    latest_grad_norm,
+                    status_message,
+                )
 
-            if self.dashboard is not None:
-                try:
-                    self.dashboard.log_metric(
-                        self.step,
-                        average_loss,
-                        latest_lr,
-                        latest_val_loss,
-                    )
-                except Exception:
-                    logger.debug(
-                        "FTRAIN dashboard metric failed.",
-                        exc_info=True,
-                    )
+                if self.dashboard is not None:
+                    try:
+                        self.dashboard.log_metric(
+                            self.step,
+                            average_loss,
+                            latest_lr,
+                            latest_val_loss,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "FTRAIN dashboard metric failed.",
+                            exc_info=True,
+                        )
 
             if (
                 cfg.checkpoint_interval > 0
                 and self.step
                 % cfg.checkpoint_interval == 0
+                and self._ddp.is_main
             ):
                 self.save_checkpoint(
                     self.step
@@ -3004,6 +3134,352 @@ class Ftrain:
             ] = boost
 
     # =========================================================================
+    # Training Intelligence (Phase 2)
+    # =========================================================================
+
+    def _start_intel(self) -> None:
+        """Initialize the training-intelligence layer (best-effort, never fatal)."""
+        self._guard = None
+        self._intel_memory = None
+        self._memory_hint: Optional[str] = None
+        self._initial_val_loss: Optional[float] = None
+
+        try:
+            from .intel import ExperimentMemory, RegressionGuard
+
+            if self.config.regression_guard:
+                self._guard = RegressionGuard(
+                    patience=self.config.regression_patience,
+                    min_delta=self.config.regression_min_delta,
+                )
+
+            if self.config.experiment_memory:
+                memory = ExperimentMemory(self.config.output_dir)
+                self._intel_memory = memory
+
+                hint = memory.hint_for(self.config.model_name)
+                if hint:
+                    self._memory_hint = hint
+                    ui.print_status(f"Memory: {hint}", level="brain")
+        except Exception:
+            logger.debug(
+                "FTRAIN: training-intel initialization failed.",
+                exc_info=True,
+            )
+
+    def _apply_maximum_power(self) -> None:
+        """
+        Extract maximum throughput from the machine (opt-in).
+
+        ``maximum_power=True`` trades memory headroom for speed: TF32,
+        cudnn benchmark, best dtype, checkpointing off when VRAM allows,
+        larger batches and parallel dataloader workers. It never touches
+        the learning rate or anything that affects correctness.
+        """
+        if not bool(getattr(self.config, "maximum_power", False)):
+            return
+
+        try:
+            from . import hardware
+            from .hardware import apply_maximum_power, maximum_power_plan
+
+            profile = hardware.detect()
+
+            model_bytes = None
+            if self.model is not None:
+                try:
+                    model_bytes = sum(
+                        p.numel() * p.element_size()
+                        for p in self.model.parameters()
+                    )
+                except Exception:
+                    model_bytes = None
+
+            plan = maximum_power_plan(
+                profile,
+                training=True,
+                model_bytes=model_bytes,
+                current_batch=int(
+                    getattr(self.config, "per_device_batch_size", 1)
+                ),
+                seq_length=int(
+                    getattr(self.config, "max_seq_length", 512)
+                ),
+            )
+
+            apply_maximum_power(plan)
+
+            cfg = self.config
+
+            if int(plan.get("suggested_batch", 0)) > int(
+                cfg.per_device_batch_size
+            ):
+                cfg.per_device_batch_size = int(plan["suggested_batch"])
+
+            suggested_workers = plan.get("suggested_workers")
+            if suggested_workers and int(cfg.dataloader_num_workers) < int(
+                suggested_workers
+            ):
+                cfg.dataloader_num_workers = int(suggested_workers)
+
+            if plan.get("pin_memory"):
+                cfg.pin_memory = True
+
+            if plan.get("gradient_checkpointing") is not None:
+                cfg.gradient_checkpointing_enable = bool(
+                    plan["gradient_checkpointing"]
+                )
+
+            ui.print_stage(
+                "MAXIMUM POWER ENGAGED",
+                (
+                    f"{profile.summary()} | "
+                    f"batch={cfg.per_device_batch_size} | "
+                    f"dtype={plan.get('dtype', 'n/a')} | "
+                    f"workers={cfg.dataloader_num_workers}"
+                ),
+                icon="⚡",
+                status="DONE",
+            )
+
+            for warning in plan.get("warnings", []):
+                ui.print_status(warning, level="warning")
+
+            for note in plan.get("applied", []):
+                ui.print_status(note, level="success")
+
+        except Exception:
+            logger.warning(
+                "FTRAIN: maximum_power mode failed; continuing normally.",
+                exc_info=True,
+            )
+
+    def _enforce_lr_guard(self) -> None:
+        """
+        Clamp unsafe full-fine-tune learning rates.
+
+        The default 2e-4 is LoRA-scale; on a full fine-tune it destroys
+        pretrained knowledge within a few hundred steps (the classic
+        "benchmark = 0 after training" failure).
+        """
+        try:
+            from .intel import safe_learning_rate
+
+            cfg = self.config
+
+            is_lora = False
+            if self.model is not None:
+                for name, parameter in self.model.named_parameters():
+                    if parameter.requires_grad and "lora" in name.lower():
+                        is_lora = True
+                        break
+
+            lr, clamped, reason = safe_learning_rate(
+                is_lora=is_lora,
+                learning_rate=float(cfg.learning_rate),
+                guard_enabled=bool(getattr(cfg, "lr_guard", True)),
+                full_finetune_max=float(
+                    getattr(cfg, "full_finetune_lr_max", 3e-5)
+                ),
+            )
+
+            if clamped:
+                logger.warning("FTRAIN LR guard: %s", reason)
+                ui.print_status(reason, level="warning")
+                cfg.learning_rate = lr
+        except Exception:
+            logger.debug("FTRAIN: LR guard failed.", exc_info=True)
+
+    def _on_validation(self, step: int, val_loss: Optional[float]) -> None:
+        """Feed the regression guard after every validation pass."""
+        guard = getattr(self, "_guard", None)
+        if guard is None or val_loss is None:
+            return
+
+        if getattr(self, "_initial_val_loss", None) is None:
+            self._initial_val_loss = float(val_loss)
+
+        try:
+            state = guard.update(step, val_loss)
+
+            if (
+                state == "ok"
+                and guard.best_step == step
+                and getattr(self.config, "save_on_best", False)
+            ):
+                try:
+                    path = self.save_checkpoint(step)
+                    ui.print_status(
+                        f"New best validation loss {val_loss:.5f} "
+                        f"at step {step}; best-checkpoint saved.",
+                        level="success",
+                    )
+                    del path
+                except Exception:
+                    logger.warning(
+                        "FTRAIN: best-checkpoint save failed.",
+                        exc_info=True,
+                    )
+
+            if guard.should_rollback and getattr(
+                self.config, "regression_rollback", True
+            ):
+                # Rank 0 decides and broadcasts the checkpoint path so all
+                # ranks roll back to exactly the same state.
+                target = (
+                    guard.rollback_target(self.config.output_dir)
+                    if self._ddp.is_main
+                    else None
+                )
+
+                if self._ddp.enabled:
+                    from .distributed import broadcast_object
+
+                    target = broadcast_object(target, self._ddp)
+
+                if target:
+                    ui.print_status(
+                        f"Regression detected — rolling back to best "
+                        f"checkpoint: {target}",
+                        level="warning",
+                    )
+                    self.load_training_state(target)
+                    guard.on_recovered()
+                else:
+                    previous = self._captain_mult
+                    self._captain_mult = max(0.25, previous * 0.5)
+
+                    if self._ddp.enabled:
+                        from .distributed import broadcast_float
+
+                        self._captain_mult = broadcast_float(
+                            self._captain_mult,
+                            self._ddp,
+                        )
+
+                    guard.on_lr_cut(step)
+                    ui.print_status(
+                        f"Regression detected, no best checkpoint yet — "
+                        f"LR multiplier {previous:.2f} → "
+                        f"{self._captain_mult:.2f}.",
+                        level="warning",
+                    )
+        except Exception:
+            logger.warning(
+                "FTRAIN: regression-guard action failed; continuing training.",
+                exc_info=True,
+            )
+
+    def _finalize_intel(self) -> None:
+        """Record the experiment in memory and write FTRAIN_REPORT.md."""
+        try:
+            from .cba import answer_three_questions
+            from .intel import build_report, evaluate_delta, write_report
+
+            cfg = self.config
+            guard = getattr(self, "_guard", None)
+
+            if getattr(self, "_intel_memory", None) is not None:
+                entry = {
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "model": cfg.model_name,
+                    "learning_rate": cfg.learning_rate,
+                    "lora_r": getattr(cfg, "lora_r", None),
+                    "steps": int(getattr(self, "step", 0)),
+                    "max_steps": int(getattr(self, "total_steps", 0)),
+                    "final_loss": getattr(self, "_last_loss", None),
+                    "best_loss": guard.best_loss if guard else None,
+                    "best_step": guard.best_step if guard else None,
+                    "val_loss": getattr(self, "_last_val_loss", None),
+                    "mode": "GRPO" if cfg.use_grpo else "SFT",
+                    "backend": (
+                        "HF/Unsloth" if cfg.use_hf_trainer else "custom"
+                    ),
+                }
+                try:
+                    count = self._intel_memory.record(entry)
+                    entry["experiment"] = count
+                    ui.print_status(
+                        f"Experiment #{count} recorded to experiment memory.",
+                        level="success",
+                    )
+                except Exception:
+                    logger.debug(
+                        "FTRAIN: experiment record failed.",
+                        exc_info=True,
+                    )
+
+            before: Dict[str, float] = {}
+            after: Dict[str, float] = {}
+
+            initial = getattr(self, "_initial_val_loss", None)
+            final = getattr(self, "_last_val_loss", None)
+            if initial is not None:
+                before["validation_loss"] = float(initial)
+            if final is not None:
+                after["validation_loss"] = float(final)
+
+            deltas = (
+                evaluate_delta(before, after)
+                if before and after
+                else None
+            )
+
+            questions = None
+            if deltas or getattr(self, "_memory_hint", None):
+                try:
+                    questions = answer_three_questions(
+                        {
+                            "decision": "training_run_complete",
+                            "confidence": 0.6 if deltas else 0.4,
+                            "evidence": [
+                                f"{key}: {row['before']:.4f} → {row['after']:.4f} "
+                                f"({row['verdict']})"
+                                for key, row in (deltas or {}).items()
+                            ],
+                        }
+                    )
+                except Exception:
+                    questions = None
+
+            content = build_report(
+                config_summary={
+                    "model": cfg.model_name,
+                    "mode": "GRPO" if cfg.use_grpo else "SFT",
+                    "backend": (
+                        "HF/Unsloth" if cfg.use_hf_trainer else "custom"
+                    ),
+                    "learning_rate": cfg.learning_rate,
+                    "steps": int(getattr(self, "step", 0)),
+                    "lora_r": getattr(cfg, "lora_r", None),
+                },
+                training_summary={
+                    "final loss": getattr(self, "_last_loss", "n/a"),
+                    "best validation loss": (
+                        guard.best_loss if guard else "n/a"
+                    ),
+                    "best step": guard.best_step if guard else "n/a",
+                    "epochs": getattr(self, "epoch", 0),
+                    "memory hint": getattr(self, "_memory_hint", None) or "none",
+                },
+                eval_deltas=deltas,
+                guard_events=guard.events if guard else None,
+                memory_hint=getattr(self, "_memory_hint", None),
+                questions=questions,
+            )
+
+            path = write_report(cfg.output_dir, content)
+            ui.print_status(
+                f"FTRAIN report written: {path}",
+                level="success",
+            )
+        except Exception:
+            logger.debug(
+                "FTRAIN: report generation failed.",
+                exc_info=True,
+            )
+
+    # =========================================================================
     # Scheduler
     # =========================================================================
 
@@ -3050,6 +3526,8 @@ class Ftrain:
             return self.scheduler
 
         lambdas = []
+
+        from .intel import captain_factor
 
         for group in self.optimizer.param_groups:
             name = group.get(
@@ -3106,10 +3584,13 @@ class Ftrain:
 
                     return (
                         base
-                        * self._captain_mult
-                        * self._captain_layer_boosts.get(
-                            group_name,
-                            1.0,
+                        * captain_factor(
+                            self._captain_mult,
+                            self._captain_layer_boosts.get(
+                                group_name,
+                                1.0,
+                            ),
+                            cfg.captain_total_clamp,
                         )
                     )
 
@@ -3181,6 +3662,33 @@ class Ftrain:
             "lengths",
             None,
         )
+
+        # ------------------------------------------------------------------
+        # Multi-GPU: shard the data across ranks so every GPU sees a
+        # disjoint slice of every epoch (the "N GPUs = one big GPU" data
+        # contract). LengthSampler packing is bypassed under DDP.
+        # ------------------------------------------------------------------
+
+        if self._ddp.enabled:
+            from torch.utils.data.distributed import DistributedSampler
+
+            distributed_sampler = DistributedSampler(
+                dataset,
+                num_replicas=self._ddp.world_size,
+                rank=self._ddp.rank,
+                shuffle=shuffle,
+                seed=int(
+                    self.config.seed
+                )
+                + self.epoch,
+                drop_last=False,
+            )
+
+            return DataLoader(
+                dataset,
+                sampler=distributed_sampler,
+                **common,
+            )
 
         if lengths is None:
             generator = torch.Generator()
@@ -3308,10 +3816,16 @@ class Ftrain:
             if batches == 0:
                 return None
 
-            result = (
+            local_mean = (
                 total_loss
                 / batches
             )
+
+            # Multi-GPU: average the validation loss across ranks so the
+            # regression guard and the Captain see the same number.
+            from .distributed import all_reduce_mean
+
+            result = all_reduce_mean(local_mean, self._ddp)
 
             self._last_val_loss = result
 
@@ -3357,6 +3871,23 @@ class Ftrain:
                     exc_info=True,
                 )
 
+        elif self.device.type == "xpu":
+            try:
+                with torch.autocast(
+                    device_type="xpu",
+                    dtype=torch.bfloat16,
+                    enabled=True,
+                ):
+                    yield
+
+                return
+
+            except Exception:
+                logger.debug(
+                    "FTRAIN: XPU autocast unavailable.",
+                    exc_info=True,
+                )
+
         elif self.device.type == "mps":
             try:
                 with torch.autocast(
@@ -3377,38 +3908,53 @@ class Ftrain:
         yield
 
     def _amp_enabled(self) -> bool:
-        if self.device.type != "cuda":
-            return False
+        if self.device.type == "cuda":
+            try:
+                return bool(
+                    self.config.load_in_4bit
+                    and not torch.cuda.is_bf16_supported()
+                )
+            except Exception:
+                return bool(
+                    self.config.load_in_4bit
+                )
 
-        try:
-            return bool(
-                self.config.load_in_4bit
-                and not torch.cuda.is_bf16_supported()
-            )
-        except Exception:
-            return bool(
-                self.config.load_in_4bit
-            )
+        # fp16 MPS/XPU runs need loss scaling for stable gradients.
+        if self.device.type in ("mps", "xpu"):
+            try:
+                return self._preferred_model_dtype() == torch.float16
+            except Exception:
+                return self.device.type == "mps"
+
+        return False
 
     def _get_scaler(self):
         if not self._amp_enabled():
             return None
 
-        if self._scaler is not None:
+        if getattr(self, "_scaler", None) is not None:
             return self._scaler
+
+        device_type = self.device.type
 
         try:
             self._scaler = torch.amp.GradScaler(
-                "cuda",
+                device_type,
                 enabled=True,
             )
-        except (
-            AttributeError,
-            TypeError,
-        ):
-            self._scaler = torch.cuda.amp.GradScaler(
-                enabled=True
-            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            if device_type == "cuda":
+                self._scaler = torch.cuda.amp.GradScaler(
+                    enabled=True
+                )
+            else:
+                logger.debug(
+                    "FTRAIN: GradScaler unavailable for %s (%s); "
+                    "training without loss scaling.",
+                    device_type,
+                    exc,
+                )
+                self._scaler = None
 
         return self._scaler
 
@@ -3520,6 +4066,10 @@ class Ftrain:
 
         self._train_started_at = time.time()
 
+        self._start_intel()
+        self._apply_maximum_power()
+        self._enforce_lr_guard()
+
         self.model.train()
 
         ui.fire_header()
@@ -3565,6 +4115,13 @@ class Ftrain:
         finally:
             self._stop_dashboard()
 
+            from .distributed import destroy_distributed
+
+            destroy_distributed()
+
+        if self._ddp.is_main:
+            self._finalize_intel()
+
         if (
             self.captain is not None
             and eval_prompt
@@ -3606,6 +4163,20 @@ class Ftrain:
             raise RuntimeError(
                 "Cannot checkpoint without a model."
             )
+
+        # Multi-GPU: only rank 0 writes checkpoints; other ranks hold
+        # identical weights and must not write to the same directory.
+        if not getattr(getattr(self, "_ddp", None), "is_main", True):
+            root = (
+                Path(self.config.output_dir).expanduser()
+                / "checkpoints"
+            )
+            tag = (
+                "final"
+                if final
+                else f"step_{int(step)}"
+            )
+            return str(root / tag)
 
         root = (
             Path(
@@ -4073,16 +4644,17 @@ class Ftrain:
             final=True,
         )
 
-        ui.print_final_summary(
-            {
-                "Model": self.config.model_name,
-                "Steps": self.step,
-                "Requested Steps": self.total_steps,
-                "Mode": mode,
-                "Backend": self._backend,
-                "Dir": str(final_path),
-            }
-        )
+        if self._ddp.is_main:
+            ui.print_final_summary(
+                {
+                    "Model": self.config.model_name,
+                    "Steps": self.step,
+                    "Requested Steps": self.total_steps,
+                    "Mode": mode,
+                    "Backend": self._backend,
+                    "Dir": str(final_path),
+                }
+            )
 
         return self.model
 
