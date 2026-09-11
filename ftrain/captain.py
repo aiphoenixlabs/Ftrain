@@ -50,7 +50,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer
+
+try:
+    from transformers import AutoTokenizer
+except Exception:  # keep the package importable on torch-only hosts
+    AutoTokenizer = None
 
 logger = logging.getLogger(__name__)
 
@@ -2205,3 +2209,38 @@ Stop: <true|false>
                 return result
 
         return None
+
+    # ========================================================================
+    # CBA integration (Phase 1) — additive, LLM-optional
+    # ========================================================================
+
+    def three_questions(
+        self,
+        context: Mapping[str, Any],
+    ) -> Dict[str, str]:
+        """
+        Answer WHAT is happening / WHY / WHAT NEXT for a decision context.
+
+        ``context`` is a mapping such as a CBA report dict (``report.to_dict()``),
+        training stats, or any mapping with relevant keys. The deterministic
+        CBA reasoner produces the answers; the LLM Captain (when loaded) is
+        only used to phrase them, never to invent facts.
+        """
+        from . import cba as cba_module
+
+        return cba_module.answer_three_questions(context)
+
+    def critique_decision(
+        self,
+        decision: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Self-critique a decision record (decision/confidence/evidence/...).
+
+        Deterministic by default; honest about missing evidence. Returns a
+        dict with confidence, potential_weakness, missing_evidence and
+        recommendation keys.
+        """
+        from . import cba as cba_module
+
+        return cba_module.critique_decision_record(decision)
