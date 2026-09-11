@@ -409,6 +409,28 @@ class TrainConfig:
     warmup_steps: int = 0
     min_lr_ratio: float = 0.1
 
+    # -------------------------------------------------------------------------
+    # Training intelligence (Phase 2): LR safety, regression guard, memory
+    # -------------------------------------------------------------------------
+
+    lr_guard: bool = True
+
+    full_finetune_lr_max: float = 3e-5
+
+    captain_total_clamp: float = 1.25
+
+    regression_guard: bool = True
+
+    regression_rollback: bool = True
+
+    regression_patience: int = 2
+
+    regression_min_delta: float = 0.001
+
+    save_on_best: bool = True
+
+    experiment_memory: bool = True
+
     layerwise_lr_decay: float = 0.85
     swiglu_gate_boost: float = 1.2
     moe_router_lr_multiplier: float = 0.5
@@ -445,6 +467,8 @@ class TrainConfig:
     pin_memory: bool = True
 
     gradient_checkpointing_enable: bool = False
+
+    maximum_power: bool = False
 
     use_adaptive_accumulation: bool = False
     target_batch_tokens: int = 8192
@@ -724,6 +748,32 @@ class TrainConfig:
             allow_zero=True,
         )
 
+        self.regression_patience = _positive_int(
+            self.regression_patience,
+            "regression_patience",
+        )
+
+        self.full_finetune_lr_max = _finite_float(
+            self.full_finetune_lr_max,
+            "full_finetune_lr_max",
+            strict_minimum=True,
+            maximum=1.0,
+        )
+
+        self.captain_total_clamp = _finite_float(
+            self.captain_total_clamp,
+            "captain_total_clamp",
+            minimum=1.0,
+            maximum=10.0,
+        )
+
+        self.regression_min_delta = _finite_float(
+            self.regression_min_delta,
+            "regression_min_delta",
+            minimum=0.0,
+            maximum=1.0,
+        )
+
         self.checkpoint_interval = _positive_int(
             self.checkpoint_interval,
             "checkpoint_interval",
@@ -770,6 +820,12 @@ class TrainConfig:
             "use_dashboard",
             "show_model_progress",
             "use_grpo",
+            "lr_guard",
+            "regression_guard",
+            "regression_rollback",
+            "save_on_best",
+            "experiment_memory",
+            "maximum_power",
         )
 
         for field_name in boolean_fields:
@@ -1309,6 +1365,7 @@ class MergeConfig:
         "slerp",
         "ties",
         "dare",
+        "cba",
     ] = "intelligent"
 
     alpha: float = 0.5
@@ -1334,6 +1391,21 @@ class MergeConfig:
     merge_knowledge_distill: bool = False
 
     force_cuda_merge: bool = False
+
+    # -------------------------------------------------------------------------
+    # CBA — Captain Brain Alignment (Phase 1 intelligence layer)
+    # -------------------------------------------------------------------------
+
+    use_cba: bool = False
+
+    cba_conflict_threshold: float = 0.65
+
+    cba_fallback: Literal[
+        "abort",
+        "intelligent",
+    ] = "abort"
+
+    maximum_power: bool = False
 
     # -------------------------------------------------------------------------
     # Hugging Face / alignment
@@ -1444,7 +1516,21 @@ class MergeConfig:
                 "slerp",
                 "ties",
                 "dare",
+                "cba",
             ),
+        )
+
+        self.cba_fallback = _enum_value(
+            self.cba_fallback,
+            "cba_fallback",
+            ("abort", "intelligent"),
+        )
+
+        self.cba_conflict_threshold = _finite_float(
+            self.cba_conflict_threshold,
+            "cba_conflict_threshold",
+            minimum=0.05,
+            maximum=1.0,
         )
 
         # ---------------------------------------------------------------------
@@ -1461,6 +1547,8 @@ class MergeConfig:
             "force_cuda_merge",
             "hugging",
             "align_grpo",
+            "use_cba",
+            "maximum_power",
         )
 
         for field_name in boolean_fields:
@@ -1495,6 +1583,15 @@ class MergeConfig:
                 "strategy='dare' selected; enabling use_dare automatically."
             )
             self.use_dare = True
+
+        if (
+            self.strategy == "cba"
+            and not self.use_cba
+        ):
+            logger.info(
+                "strategy='cba' selected; enabling use_cba automatically."
+            )
+            self.use_cba = True
 
         if (
             self.merge_knowledge_distill
