@@ -1,25 +1,27 @@
 """
-FTRAIN UI v1.1
-==============
+FTRAIN UI v1.2 "Aurora"
+=======================
 Beautiful, robust, dependency-free terminal UI for the FTRAIN engine.
 
-Features
---------
-- FTRAIN v1.1 branding
-- Cross-platform ANSI/color detection
-- Beautiful fire header
-- Smart progress bars
-- Training dashboard rows
-- Merge progress
-- Captain reports
-- Stage banners
-- Metric cards
-- Final summaries
-- Animated loading bars
-- Thread-safe terminal writes
-- No crashes when output is redirected
-- Safe formatting of arbitrary values
-- Backward-compatible public API
+v1.2 highlights
+---------------
+- Truecolor (24-bit) gradients for banners, bars and pills, with a graceful
+  256-color fallback and a plain-text fallback when color is unavailable.
+- Windows legacy console support: enables ANSI virtual-terminal processing
+  via the Win32 API instead of silently dropping every escape sequence.
+- Display-width-aware box drawing: emoji, CJK and other wide characters no
+  longer break panel alignment.
+- Smooth multi-stop gradient progress bars with milestone coloring.
+- Markdown-flavored Captain reports (headings, bullets, bold, code, links).
+- Animated braille-spinner loading bar with elapsed/duration reporting.
+- Fixed-width aligned training/merge rows so repeated lines stop jittering.
+- Backward-compatible public API: every v1.1 name and signature is kept.
+
+Environment switches
+--------------------
+- ``FTRAIN_NO_COLOR`` or ``NO_COLOR``: disable all ANSI styling.
+- ``FTRAIN_FORCE_COLOR`` / ``FORCE_COLOR``: force styling even when stdout
+  is redirected (useful for demos and captured logs).
 """
 
 from __future__ import annotations
@@ -30,7 +32,8 @@ import shutil
 import sys
 import threading
 import time
-from typing import Any, Dict, Iterable, Mapping, Optional
+import unicodedata
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 # ============================================================================
@@ -42,6 +45,7 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 ITALIC = "\033[3m"
+UNDERLINE = "\033[4m"
 
 # Foreground colors
 BLACK = "\033[30m"
@@ -68,6 +72,7 @@ BG_CYAN = "\033[48;5;45m"
 BG_YELLOW = "\033[48;5;226m"
 BG_ORANGE = "\033[48;5;208m"
 BG_RED = "\033[48;5;196m"
+BG_GREEN = "\033[48;5;35m"
 BG_GRAY = "\033[48;5;236m"
 BG_DARK = "\033[48;5;234m"
 
@@ -81,6 +86,46 @@ NEON_GREEN = "\033[38;5;46m"
 NEON_BLUE = "\033[38;5;39m"
 
 _OUTPUT_LOCK = threading.RLock()
+
+
+def _enable_windows_vt() -> bool:
+    """
+    Enable ANSI virtual-terminal processing on legacy Windows consoles.
+
+    Modern Windows Terminal reports VT support natively; classic conhost
+    (Windows 10/11) accepts escape sequences only after the console mode is
+    switched on. Without this, every color code renders as ``←[38;5;214m``.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        if not handle or handle == -1:
+            return False
+
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+
+        if mode.value & 0x0004:  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            return True
+
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
+
+def _force_color_env() -> bool:
+    for name in ("FTRAIN_FORCE_COLOR", "FORCE_COLOR"):
+        value = os.environ.get(name, "").strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value:
+            return False
+    return False
 
 
 def _supports_color() -> bool:
@@ -97,11 +142,23 @@ def _supports_color() -> bool:
         if os.environ.get("NO_COLOR") is not None:
             return False
 
+        if _force_color_env():
+            _enable_windows_vt()
+            return True
+
         stream = sys.stdout
         if not hasattr(stream, "isatty"):
             return False
 
-        return bool(stream.isatty())
+        if not stream.isatty():
+            return False
+
+        if os.name == "nt":
+            # Terminal-native VT support (WT_SESSION) still benefits from an
+            # explicit enable on some shells; it is a no-op when already set.
+            _enable_windows_vt()
+
+        return True
 
     except Exception:
         return False
@@ -110,11 +167,171 @@ def _supports_color() -> bool:
 USE_COLOR = _supports_color()
 
 
+def _detect_truecolor() -> bool:
+    if not USE_COLOR:
+        return False
+    try:
+        colorterm = os.environ.get("COLORTERM", "").strip().lower()
+        if "truecolor" in colorterm or "24bit" in colorterm:
+            return True
+        if os.environ.get("WT_SESSION"):
+            return True
+        term = os.environ.get("TERM", "").strip().lower()
+        if "truecolor" in term or "24bit" in term:
+            return True
+        # iTerm2 and compatible terminals advertise TERM_PROGRAM.
+        if os.environ.get("TERM_PROGRAM", "").strip().lower() in {
+            "iterm.app",
+            "wezterm",
+            "vscode",
+        }:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+USE_TRUECOLOR = _detect_truecolor()
+
+
 def _c(code: str, text: Any) -> str:
     """Apply an ANSI code when supported."""
     value = str(text)
     return f"{code}{value}{RESET}" if USE_COLOR else value
 
+
+# ============================================================================
+# Truecolor primitives
+# ============================================================================
+
+def _rgb(r: int, g: int, b: int) -> Tuple[int, int, int]:
+    return (max(0, min(255, int(r))), max(0, min(255, int(g))), max(0, min(255, int(b))))
+
+
+def _blend(a: Tuple[int, int, int], b: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
+    t = max(0.0, min(1.0, float(t)))
+    return _rgb(
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    )
+
+
+def _sample_gradient(stops: Sequence[Tuple[int, int, int]], t: float) -> Tuple[int, int, int]:
+    """Sample a multi-stop gradient at position ``t`` in [0, 1]."""
+    if not stops:
+        return _rgb(255, 255, 255)
+    if len(stops) == 1:
+        return stops[0]
+
+    t = max(0.0, min(1.0, float(t)))
+    segments = len(stops) - 1
+    position = t * segments
+    index = min(int(position), segments - 1)
+    local = position - index
+    return _blend(stops[index], stops[index + 1], local)
+
+
+def _rgb_to_256(color: Tuple[int, int, int]) -> int:
+    """Map an RGB triple to the nearest xterm-256 palette index."""
+    r, g, b = color
+
+    if abs(r - g) < 8 and abs(g - b) < 8 and abs(r - b) < 8:
+        if r < 8:
+            return 16
+        if r > 238:
+            return 231
+        return 232 + max(0, min(23, round((r - 8) / 10.0)))
+
+    cube = (0, 95, 135, 175, 215, 255)
+
+    def nearest(channel: int) -> int:
+        return min(range(6), key=lambda i: (cube[i] - channel) ** 2)
+
+    ri, gi, bi = nearest(r), nearest(g), nearest(b)
+    cube_error = (
+        (cube[ri] - r) ** 2
+        + (cube[gi] - g) ** 2
+        + (cube[bi] - b) ** 2
+    )
+
+    gray = 232 + max(0, min(23, round(((r + g + b) / 3.0 - 8) / 10.0)))
+    gray_level = 8 + 10 * (gray - 232)
+    gray_error = (gray_level - r) ** 2 + (gray_level - g) ** 2 + (gray_level - b) ** 2
+
+    if gray_error < cube_error:
+        return gray
+    return 16 + 36 * ri + 6 * gi + bi
+
+
+def _fg(color: Tuple[int, int, int]) -> str:
+    if not USE_COLOR:
+        return ""
+    if USE_TRUECOLOR:
+        return f"\033[38;2;{color[0]};{color[1]};{color[2]}m"
+    return f"\033[38;5;{_rgb_to_256(color)}m"
+
+
+def _bg(color: Tuple[int, int, int]) -> str:
+    if not USE_COLOR:
+        return ""
+    if USE_TRUECOLOR:
+        return f"\033[48;2;{color[0]};{color[1]};{color[2]}m"
+    return f"\033[48;5;{_rgb_to_256(color)}m"
+
+
+def _paint(color: Tuple[int, int, int], text: Any) -> str:
+    """Colorize text with an RGB/256-auto foreground color."""
+    value = str(text)
+    if not USE_COLOR:
+        return value
+    return f"{_fg(color)}{value}{RESET}"
+
+
+# Aurora palette ------------------------------------------------------------
+# Named roles keep the visual identity consistent across every renderer.
+
+AURORA_BLUE = _rgb(59, 130, 246)
+AURORA_CYAN = _rgb(34, 211, 238)
+AURORA_MINT = _rgb(16, 185, 129)
+AURORA_AMBER = _rgb(250, 204, 21)
+AURORA_ORANGE = _rgb(249, 115, 22)
+AURORA_RED = _rgb(220, 38, 38)
+AURORA_VIOLET = _rgb(139, 92, 246)
+AURORA_GOLD = _rgb(255, 191, 73)
+AURORA_TEXT = _rgb(226, 232, 240)
+AURORA_MUTED = _rgb(122, 132, 150)
+AURORA_RULE = _rgb(64, 72, 90)
+AURORA_TRACK = _rgb(52, 58, 72)
+AURORA_SUCCESS = _rgb(52, 211, 153)
+AURORA_DANGER = _rgb(248, 113, 113)
+AURORA_WARN = _rgb(251, 191, 36)
+
+# Progress gradients
+GRADIENT_TRAIN: Tuple[Tuple[int, int, int], ...] = (
+    AURORA_BLUE,
+    AURORA_CYAN,
+    AURORA_MINT,
+    AURORA_AMBER,
+    AURORA_ORANGE,
+)
+GRADIENT_MERGE: Tuple[Tuple[int, int, int], ...] = (
+    AURORA_BLUE,
+    AURORA_CYAN,
+    AURORA_AMBER,
+    AURORA_ORANGE,
+    AURORA_RED,
+)
+GRADIENT_FIRE: Tuple[Tuple[int, int, int], ...] = (
+    _rgb(255, 214, 112),
+    AURORA_GOLD,
+    AURORA_ORANGE,
+    _rgb(235, 68, 68),
+)
+
+# ============================================================================
+# Thread-safe output
+# ============================================================================
 
 def _emit(text: str = "", *, end: str = "\n", flush: bool = True) -> None:
     """Thread-safe terminal output."""
@@ -143,6 +360,94 @@ def _terminal_width(default: int = 88) -> int:
         return max(60, min(shutil.get_terminal_size((default, 20)).columns, 140))
     except Exception:
         return default
+
+
+# ============================================================================
+# Display-width helpers (wide glyph aware)
+# ============================================================================
+
+# Codepoint ranges that render two cells wide in nearly every terminal
+# (emoji with mandatory presentation + CJK/fullwidth via east_asian_width).
+_WIDE_RANGES: Tuple[Tuple[int, int], ...] = (
+    (0x1100, 0x115F),
+    (0x2329, 0x232A),
+    (0x2E80, 0x303E),
+    (0x3041, 0x33FF),
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xA000, 0xA4CF),
+    (0xAC00, 0xD7A3),
+    (0xF900, 0xFAFF),
+    (0xFE10, 0xFE19),
+    (0xFE30, 0xFE6F),
+    (0xFF00, 0xFF60),
+    (0xFFE0, 0xFFE6),
+    (0x1F000, 0x1F0FF),
+    (0x1F100, 0x1F1FF),
+    (0x1F200, 0x1F2FF),
+    (0x1F300, 0x1F64F),
+    (0x1F680, 0x1F6FF),
+    (0x1F900, 0x1F9FF),
+    (0x1FA00, 0x1FAFF),
+    (0x20000, 0x3FFFD),
+)
+
+# Emoji that sit below 0x1F000 but still render wide by default.
+_WIDE_SINGLETONS: Tuple[int, ...] = (
+    0x231A, 0x231B, 0x23E9, 0x23EA, 0x23EB, 0x23EC, 0x23F0, 0x23F3,
+    0x25FD, 0x25FE, 0x2614, 0x2615, 0x2648, 0x2649, 0x2650, 0x2651,
+    0x2652, 0x2653, 0x267F, 0x2693, 0x26A1, 0x26AA, 0x26AB, 0x26BD,
+    0x26BE, 0x26C4, 0x26C5, 0x26CE, 0x26D4, 0x26EA, 0x26F2, 0x26F3,
+    0x26F5, 0x26FA, 0x26FD, 0x2705, 0x270A, 0x270B, 0x2728, 0x274C,
+    0x274E, 0x2753, 0x2754, 0x2755, 0x2757, 0x2795, 0x2796, 0x2797,
+    0x27B0, 0x27BF, 0x2B1B, 0x2B1C, 0x2B50, 0x2B55,
+)
+
+
+def _char_width(ch: str) -> int:
+    code = ord(ch)
+    if unicodedata.combining(ch) or code in (0x200D,) or 0xFE00 <= code <= 0xFE0F:
+        return 0
+    for low, high in _WIDE_RANGES:
+        if low <= code <= high:
+            return 2
+    if code in _WIDE_SINGLETONS:
+        return 2
+    return 1
+
+
+def _display_width(text: str) -> int:
+    """Rendered width of ``text`` ignoring ANSI escape sequences."""
+    plain = _strip_ansi(text)
+    return sum(_char_width(ch) for ch in plain)
+
+
+def _pad(text: str, width: int, *, align: str = "left") -> str:
+    """Pad ``text`` (which may contain ANSI codes) to a display width."""
+    delta = width - _display_width(text)
+    if delta <= 0:
+        return text
+    if align == "right":
+        return " " * delta + text
+    if align == "center":
+        left = delta // 2
+        return " " * left + text + " " * (delta - left)
+    return text + " " * delta
+
+
+def _truncate_width(text: str, width: int) -> str:
+    """Truncate a plain string to at most ``width`` display cells."""
+    if width <= 0:
+        return ""
+    if _display_width(text) <= width:
+        return text
+
+    accumulated = 0
+    for index, ch in enumerate(text):
+        accumulated += _char_width(ch)
+        if accumulated > width - 1:
+            return text[:index] + "…"
+    return text
 
 
 # ============================================================================
@@ -226,6 +531,38 @@ def _human_number(value: Any) -> str:
     return f"{number:.2f}"
 
 
+def _format_value(value: Any) -> str:
+    """Type-aware scalar rendering used by summary cards."""
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        return _format_metric(value)
+    if isinstance(value, int):
+        return f"{value:,}" if abs(value) >= 10_000 else str(value)
+    return str(value)
+
+
+def _value_color(key: str, value: Any) -> Tuple[Tuple[int, int, int], Optional[str]]:
+    """Pick (rgb color, optional prefix format) for a metric-card value."""
+    key_l = str(key).lower()
+
+    if isinstance(value, bool):
+        return (AURORA_SUCCESS if value else AURORA_DANGER), None
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if any(token in key_l for token in ("rate", "ratio", "coverage", "improvement", "percent", "pct", "accuracy", "health")):
+            number = _safe_float(value, 0.0)
+            return AURORA_GOLD, f"{number * 100:.2f}%"
+        return AURORA_GOLD, None
+
+    text = str(value)
+    if text.startswith(("http://", "https://")):
+        return AURORA_CYAN, None
+    return AURORA_TEXT, None
+
+
 def _truncate(text: Any, width: int) -> str:
     value = str(text).replace("\n", " ").replace("\r", " ")
     if len(value) <= width:
@@ -248,25 +585,82 @@ def _rule(width: Optional[int] = None, char: str = "─") -> str:
     return _c(DARK_GRAY, char * width)
 
 
+def _gradient_rule(width: int, stops: Sequence[Tuple[int, int, int]] = GRADIENT_FIRE) -> str:
+    """Horizontal rule whose color flows across the terminal."""
+    if not USE_COLOR or width <= 0:
+        return "─" * width
+
+    chars: List[str] = []
+    for index in range(width):
+        t = index / max(1, width - 1)
+        color = _sample_gradient(stops, t)
+        chars.append(f"{_fg(color)}━")
+    return "".join(chars) + RESET
+
+
 def _box_title(title: str, width: Optional[int] = None) -> str:
     width = width or _terminal_width()
     inner = max(8, width - 4)
+    title_text = _truncate_width(_sanitize_text(title), inner)
     return (
         _c(DARK_GRAY, "╭" + "─" * (inner + 2) + "╮")
         + "\n"
         + _c(DARK_GRAY, "│ ")
-        + _c(BOLD + NEON_CYAN, _truncate(title, inner))
-        + _c(DARK_GRAY, " " * max(0, inner - len(_truncate(title, inner))) + " │")
+        + _c(BOLD + NEON_CYAN, title_text)
+        + _c(DARK_GRAY, " " * max(0, inner - _display_width(title_text)) + " │")
         + "\n"
         + _c(DARK_GRAY, "╰" + "─" * (inner + 2) + "╯")
     )
 
 
 def _card_line(label: str, value: Any, width: int = 34) -> str:
-    label_text = _truncate(label, width)
+    label_text = _truncate_width(_sanitize_text(label), width)
+    return f"{_c(BOLD, label_text)} {_c(NEON_CYAN, value)}"
+
+
+def _panel_open(width: int) -> str:
+    return _paint(AURORA_RULE, "╭" + "─" * (width - 2) + "╮")
+
+
+def _panel_close(width: int) -> str:
+    return _paint(AURORA_RULE, "╰" + "─" * (width - 2) + "╯")
+
+
+def _panel_divider(width: int) -> str:
+    return _paint(AURORA_RULE, "├" + "─" * (width - 2) + "┤")
+
+
+def _panel_line(content: str, width: int, *, pad_left: int = 2) -> str:
+    """A boxed row: `│ content<pad> │` with display-width-correct padding.
+
+    Content must already be wrapped/truncated to fit; the padding is purely
+    display-width aware (ANSI codes and wide glyphs are measured correctly).
+    """
+    inner_width = width - 2 - pad_left - 1
+    padding = " " * max(0, inner_width - _display_width(content))
     return (
-        f"{_c(BOLD, label_text):<{width + (0 if not USE_COLOR else 0)}} "
-        f"{_c(NEON_CYAN, value)}"
+        _paint(AURORA_RULE, "│")
+        + " " * pad_left
+        + content
+        + padding
+        + " "
+        + _paint(AURORA_RULE, "│")
+    )
+
+
+def _panel_title(title: str, width: int, *, icon: str = "") -> str:
+    label = f"{icon} {title}".strip()
+    title_text = _pad(
+        _c(BOLD + BRIGHT_WHITE, _truncate_width(_sanitize_text(label), width - 8)),
+        width - 4,
+        align="left",
+    )
+    return (
+        _paint(AURORA_RULE, "│")
+        + " "
+        + title_text
+        + " "
+        + _paint(AURORA_RULE, "│")
     )
 
 
@@ -286,6 +680,10 @@ def gradient_bar(
     """
     Render a smooth terminal progress bar.
 
+    v1.2 renders every filled cell with its own color sampled from a
+    multi-stop gradient (truecolor when available, 256-color otherwise),
+    producing a continuous color flow instead of four flat bands.
+
     Backward compatible with the original signature.
     """
     try:
@@ -296,35 +694,26 @@ def gradient_bar(
     value = max(0.0, min(1.0, value))
     width = max(4, int(width))
     filled = int(round(value * width))
-
-    if from_blue_to_orange:
-        if value < 0.34:
-            fill_code = BG_BLUE
-        elif value < 0.67:
-            fill_code = BG_ORANGE
-        else:
-            fill_code = BG_RED
-    else:
-        if value < 0.25:
-            fill_code = BG_BLUE
-        elif value < 0.50:
-            fill_code = BG_CYAN
-        elif value < 0.75:
-            fill_code = BG_YELLOW
-        else:
-            fill_code = BG_ORANGE
+    stops = GRADIENT_MERGE if from_blue_to_orange else GRADIENT_TRAIN
 
     if not USE_COLOR:
-        fill = "━"
-        empty = "─"
         result = "█" * filled + "░" * (width - filled)
     else:
-        fill = f"{fill_code}{fill_char}{RESET}"
-        empty = f"{BG_GRAY}{empty_char}{RESET}"
-        result = fill * filled + empty * (width - filled)
+        cells: List[str] = []
+        for index in range(width):
+            t = index / max(1, width - 1)
+            if index < filled:
+                color = _sample_gradient(stops, t if filled > 1 else 0.0)
+                cells.append(
+                    f"{_bg(color)}{fill_char}{RESET}"
+                )
+            else:
+                cells.append(f"{_bg(AURORA_TRACK)}{empty_char}{RESET}")
+        result = "".join(cells)
 
     if show_percent:
-        return f"[{result}] {value * 100:6.2f}%"
+        percent = _paint(AURORA_GOLD, f"{value * 100:6.2f}%")
+        return f"[{result}] {percent}"
 
     return f"|{result}|"
 
@@ -336,12 +725,25 @@ def _thin_bar(progress: float, width: int = 30) -> str:
     if not USE_COLOR:
         return "[" + "━" * filled + "─" * (width - filled) + "]"
 
-    return (
-        "["
-        + _c(ORANGE, "━" * filled)
-        + _c(DARK_GRAY, "─" * (width - filled))
-        + "]"
-    )
+    cells: List[str] = []
+    for index in range(width):
+        if index < filled:
+            t = index / max(1, width - 1)
+            color = _sample_gradient(GRADIENT_TRAIN, t if filled > 1 else 0.0)
+            cells.append(f"{_fg(color)}━")
+        else:
+            cells.append(f"{_fg(AURORA_TRACK)}─")
+    return "[" + "".join(cells) + RESET + "]"
+
+
+def _milestone_color(value: float) -> Tuple[int, int, int]:
+    if value >= 1.0:
+        return AURORA_SUCCESS
+    if value >= 0.67:
+        return AURORA_MINT
+    if value >= 0.34:
+        return AURORA_CYAN
+    return AURORA_GOLD
 
 
 # ============================================================================
@@ -358,47 +760,99 @@ _FTRAIN_ART = r"""
 """
 
 
+def _art_lines() -> List[str]:
+    return [line for line in _FTRAIN_ART.strip("\n").splitlines()]
+
+
 def fire_header(
     version: str = "1.1.0",
     subtitle: str = "Adaptive Training • Intelligent Merging • Captain AI",
 ) -> None:
-    """Print the main FTRAIN v1.1 startup banner."""
+    """Print the main FTRAIN startup banner with a fire-gradient wordmark."""
     width = min(_terminal_width(), 96)
-    sep = "═" * width
 
     if USE_COLOR:
         _emit("")
-        _emit(_c(ORANGE, _FTRAIN_ART.rstrip()))
-        _emit(_c(DARK_GRAY, sep))
+
+        art_lines = _art_lines()
+        count = max(1, len(art_lines) - 1)
+        for index, line in enumerate(art_lines):
+            t = index / count
+            color = _sample_gradient(GRADIENT_FIRE, t)
+            _emit(_paint(color, line))
+
+        _emit(_gradient_rule(width))
+        _emit("")
         _emit(
-            _c(
-                BOLD + GOLD,
-                f"🔥🔥  FTRAIN ENGINE v{version}  🔥🔥",
+            _pad(
+                _c(BOLD + BRIGHT_WHITE, "🔥 FTRAIN ENGINE ")
+                + _c(BOLD + GOLD, f"v{version}")
+                + _c(BOLD + BRIGHT_WHITE, " 🔥"),
+                width,
+                align="center",
             )
         )
-        _emit(_c(NEON_CYAN, _truncate(subtitle, width)))
-        _emit(_c(DARK_GRAY, sep))
+        _emit("")
         _emit(
-            _c(
-                DIM + GRAY,
-                "   TRAIN  •  ADAPT  •  MERGE  •  EVOLVE",
+            _pad(
+                _c(DIM + GRAY, _truncate_width(subtitle, width - 4)),
+                width,
+                align="center",
+            )
+        )
+        _emit("")
+        _emit(
+            _pad(
+                _gradient_rule(min(64, width), GRADIENT_TRAIN)
+                + RESET
+                + _c(DIM + GRAY, "  TRAIN • ADAPT • MERGE • EVOLVE  ")
+                + _gradient_rule(min(64, width), GRADIENT_MERGE)
+                + RESET,
+                width,
+                align="center",
             )
         )
         _emit("")
     else:
         _emit("")
         _emit(_FTRAIN_ART.rstrip())
-        _emit(sep)
-        _emit(f"🔥🔥  FTRAIN ENGINE v{version}  🔥🔥")
-        _emit(subtitle)
-        _emit(sep)
-        _emit("   TRAIN  •  ADAPT  •  MERGE  •  EVOLVE")
+        _emit("═" * width)
+        _emit(f"🔥 FTRAIN ENGINE v{version} 🔥".center(width))
+        _emit(subtitle.center(width))
+        _emit("═" * width)
+        _emit("TRAIN • ADAPT • MERGE • EVOLVE".center(width))
         _emit("")
 
 
 # ============================================================================
 # Stage / status UI
 # ============================================================================
+
+_STATUS_PILLS: Mapping[str, Tuple[str, Tuple[int, int, int]]] = {
+    "done": ("DONE", AURORA_SUCCESS),
+    "success": ("SUCCESS", AURORA_SUCCESS),
+    "ok": ("DONE", AURORA_SUCCESS),
+    "error": ("FAILED", AURORA_DANGER),
+    "failed": ("FAILED", AURORA_DANGER),
+    "warn": ("WARNING", AURORA_WARN),
+    "warning": ("WARNING", AURORA_WARN),
+    "running": ("RUNNING", AURORA_CYAN),
+}
+
+
+def _status_pill(status: str) -> str:
+    """A solid-background status chip: `● RUNNING` on a colored pill."""
+    key = str(status).strip().lower()
+    label, color = _STATUS_PILLS.get(key, ("RUNNING", AURORA_CYAN))
+
+    if not USE_COLOR:
+        return f"[{label}]"
+
+    fill = _bg(color)
+    text = f"● {label}"
+    # Dark text on bright pills reads best on both dark and light themes.
+    return f"{fill}\033[38;5;16m{text}{RESET}"
+
 
 def print_stage(
     title: str,
@@ -408,34 +862,30 @@ def print_stage(
 ) -> None:
     """Beautiful stage banner for core training/merging phases."""
     width = min(_terminal_width(), 96)
-    status_upper = str(status).upper()
 
-    if status_upper in {"DONE", "SUCCESS", "OK"}:
-        status_text = _c(BOLD + NEON_GREEN, "● DONE")
-    elif status_upper in {"ERROR", "FAILED"}:
-        status_text = _c(BOLD + BRIGHT_RED, "● FAILED")
-    elif status_upper in {"WARN", "WARNING"}:
-        status_text = _c(BOLD + BRIGHT_YELLOW, "● WARNING")
-    else:
-        status_text = _c(BOLD + NEON_CYAN, "● RUNNING")
+    header = f"{icon}  {_sanitize_text(title)}"
+    pill = _status_pill(status)
+    header_pad = max(0, width - 4 - _display_width(header) - _display_width(pill))
 
     _emit("")
-    _emit(_c(DARK_GRAY, "╭" + "─" * (width - 2) + "╮"))
-    header = f"{icon}  {title}"
+    _emit(_panel_open(width))
     _emit(
-        _c(DARK_GRAY, "│ ")
-        + _c(BOLD + GOLD, _truncate(header, width - 10))
+        _paint(AURORA_RULE, "│ ")
+        + _c(BOLD + GOLD, _truncate_width(header, width - 6))
+        + " " * header_pad
         + " "
-        + status_text
-        + _c(DARK_GRAY, " " * max(0, width - len(_strip_ansi(header)) - 17) + "│")
+        + pill
+        + " "
+        + _paint(AURORA_RULE, "│")
     )
     if message:
         _emit(
-            _c(DARK_GRAY, "│ ")
-            + _c(GRAY, _truncate(message, width - 4))
-            + _c(DARK_GRAY, " " * max(0, width - len(_sanitize_text(message)) - 4) + "│")
+            _panel_line(
+                _c(GRAY, _truncate_width(_sanitize_text(message), width - 8)),
+                width,
+            )
         )
-    _emit(_c(DARK_GRAY, "╰" + "─" * (width - 2) + "╯"))
+    _emit(_panel_close(width))
 
 
 def print_status(
@@ -459,16 +909,16 @@ def print_status(
         }.get(level, "•")
 
     color = {
-        "info": NEON_CYAN,
-        "success": NEON_GREEN,
-        "warning": BRIGHT_YELLOW,
-        "error": BRIGHT_RED,
-        "brain": NEON_CYAN,
-        "merge": ORANGE,
-        "train": GOLD,
-    }.get(level, WHITE)
+        "info": AURORA_CYAN,
+        "success": AURORA_SUCCESS,
+        "warning": AURORA_WARN,
+        "error": AURORA_DANGER,
+        "brain": AURORA_CYAN,
+        "merge": AURORA_ORANGE,
+        "train": AURORA_GOLD,
+    }.get(level, AURORA_TEXT)
 
-    _emit(f"{icon} {_c(color, _sanitize_text(message))}")
+    _emit(f"{icon} {_paint(color, _sanitize_text(message))}")
 
 
 # ============================================================================
@@ -488,53 +938,51 @@ def print_train_table(
     tokens_per_second: Optional[float] = None,
     epoch: Optional[Any] = None,
 ) -> None:
-    """Print a rich training row while preserving the original API."""
+    """Print an aligned training row while preserving the original API."""
     total = _safe_float(total_steps, 0.0) or 0.0
     current = _safe_float(step, 0.0) or 0.0
     progress = current / total if total > 0 else 0.0
     progress = max(0.0, min(1.0, progress))
 
-    step_text = (
-        f"{int(current):>5}/{int(total):<5}"
-        if total.is_integer()
-        else f"{current:>5.1f}/{total:<5.1f}"
-    )
+    digits = max(len(str(int(total))), 1)
+    step_text = f"{int(current):0{digits}d}/{int(total):0{digits}d}"
 
     loss_str = _format_metric(loss)
     val_str = _format_metric(val_loss)
     lr_str = _format_lr(lr)
     grad_str = _format_metric(grad_norm)
-    epoch_str = _truncate(epoch, 8) if epoch is not None else None
+    epoch_str = _truncate_width(str(epoch), 8) if epoch is not None else None
 
     chunks = [
-        f"🔥 {_c(BOLD, 'Step')} {_c(NEON_CYAN, step_text)}",
-        f"Loss {_c(ORANGE, loss_str)}",
-        f"Val {_c(NEON_BLUE, val_str)}",
-        f"LR {_c(NEON_CYAN, lr_str)}",
-        f"Grad {_c(GOLD, grad_str)}",
+        f"🔥 {_c(BOLD, 'Step')} {_paint(AURORA_CYAN, step_text)}",
+        f"Loss {_paint(AURORA_GOLD, loss_str)}",
+        f"Val {_paint(AURORA_CYAN, val_str)}",
+        f"LR {_paint(AURORA_BLUE, lr_str)}",
+        f"Grad {_paint(AURORA_ORANGE, grad_str)}",
     ]
 
     if epoch_str is not None:
-        chunks.append(f"Epoch {_c(NEON_GREEN, epoch_str)}")
+        chunks.append(f"Ep {_paint(AURORA_SUCCESS, epoch_str)}")
 
     if elapsed is not None:
         chunks.append(f"Time {_c(GRAY, _format_duration(elapsed))}")
 
     if tokens_per_second is not None:
         chunks.append(
-            f"Tok/s {_c(NEON_GREEN, _human_number(tokens_per_second))}"
+            f"Tok/s {_paint(AURORA_SUCCESS, _human_number(tokens_per_second))}"
         )
 
     if captain_msg:
         chunks.append(
-            f"🧠 {_c(NEON_CYAN, _truncate(captain_msg, 34))}"
+            f"🧠 {_paint(AURORA_CYAN, _truncate_width(_sanitize_text(captain_msg), 34))}"
         )
 
     line = (
         " ".join(chunks)
         + "  "
         + _thin_bar(progress, 18)
-        + f" {_c(BOLD + GOLD, f'{progress * 100:6.2f}%')}"
+        + " "
+        + _paint(_milestone_color(progress), f"{progress * 100:6.2f}%")
     )
 
     _rewrite(line)
@@ -560,28 +1008,28 @@ def print_training_metrics(
     captain: Optional[str] = None,
     throughput: Optional[float] = None,
 ) -> None:
-    """Dedicated v1.1 metrics row."""
+    """Dedicated v1.1 metrics row with v1.2 gradient bar."""
     parts = [
-        f"{_c(BOLD, 'STEP')} {_c(NEON_CYAN, f'{step}/{total_steps}')}",
-        f"L={_c(ORANGE, _format_metric(loss))}",
-        f"V={_c(NEON_BLUE, _format_metric(val_loss))}",
-        f"LR={_c(NEON_CYAN, _format_lr(lr))}",
-        f"G={_c(GOLD, _format_metric(grad_norm))}",
+        f"{_c(BOLD, 'STEP')} {_paint(AURORA_CYAN, f'{step}/{total_steps}')}",
+        f"L={_paint(AURORA_GOLD, _format_metric(loss))}",
+        f"V={_paint(AURORA_CYAN, _format_metric(val_loss))}",
+        f"LR={_paint(AURORA_BLUE, _format_lr(lr))}",
+        f"G={_paint(AURORA_ORANGE, _format_metric(grad_norm))}",
     ]
 
     if grad_health is not None:
         parts.append(
-            f"GH={_c(NEON_GREEN, f'{float(grad_health):.2%}')}"
+            f"GH={_paint(AURORA_SUCCESS, f'{float(grad_health):.2%}')}"
         )
 
     if throughput is not None:
         parts.append(
-            f"T={_c(NEON_GREEN, f'{throughput:.1f}/s')}"
+            f"T={_paint(AURORA_SUCCESS, f'{throughput:.1f}/s')}"
         )
 
     if captain:
         parts.append(
-            f"🧠 {_c(NEON_CYAN, _truncate(captain, 30))}"
+            f"🧠 {_paint(AURORA_CYAN, _truncate_width(_sanitize_text(captain), 30))}"
         )
 
     progress = (
@@ -589,6 +1037,7 @@ def print_training_metrics(
         if total_steps
         else 0.0
     )
+    progress = max(0.0, min(1.0, progress))
 
     _rewrite(
         " │ ".join(parts)
@@ -626,8 +1075,8 @@ def print_merge_progress(
     progress = max(0.0, min(1.0, progress))
 
     parts = [
-        f"🧩 {_c(BOLD + NEON_CYAN, 'MERGE')}",
-        f"{_c(BOLD, f'{progress * 100:6.2f}%')}",
+        f"🧩 {_c(BOLD + BRIGHT_WHITE, 'MERGE')}",
+        _paint(_milestone_color(progress), f"{progress * 100:6.2f}%"),
         gradient_bar(
             progress,
             24,
@@ -636,22 +1085,22 @@ def print_merge_progress(
     ]
 
     if matched is not None:
-        parts.append(f"M:{_c(NEON_GREEN, matched)}")
+        parts.append(f"M:{_paint(AURORA_SUCCESS, matched)}")
 
     if projected is not None:
-        parts.append(f"P:{_c(GOLD, projected)}")
+        parts.append(f"P:{_paint(AURORA_GOLD, projected)}")
 
     if rejected is not None:
-        parts.append(f"R:{_c(BRIGHT_RED, rejected)}")
+        parts.append(f"R:{_paint(AURORA_DANGER, rejected)}")
 
     if strategy:
         parts.append(
-            f"[{_c(NEON_CYAN, _truncate(strategy, 18))}]"
+            f"[{_paint(AURORA_CYAN, _truncate_width(_sanitize_text(strategy), 18))}]"
         )
 
     if message:
         parts.append(
-            f"{_c(GRAY, '(' + _truncate(message, 36) + ')')}"
+            f"{_c(GRAY, '(' + _truncate(_sanitize_text(message), 36) + ')')}"
         )
 
     _rewrite(" ".join(parts))
@@ -669,32 +1118,117 @@ def print_merge_progress(
 # Captain
 # ============================================================================
 
+_URL_RE = re.compile(r"(https?://[^\s)\]»]+)")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_CODE_RE = re.compile(r"`([^`]+)`")
+
+
+def _style_inline(text: str) -> str:
+    """Apply markdown-ish inline styling when color is available."""
+    if not USE_COLOR:
+        return text
+
+    text = _BOLD_RE.sub(lambda m: f"{BOLD}{m.group(1)}{RESET}", text)
+    text = _CODE_RE.sub(lambda m: f"{GOLD}{m.group(1)}{RESET}", text)
+    text = _URL_RE.sub(
+        lambda m: f"{NEON_CYAN}{UNDERLINE}{m.group(1)}{RESET}", text
+    )
+    return text
+
+
+def _captain_body_lines(report: str, width: int) -> List[str]:
+    """Convert a Captain report into styled, wrapped box lines."""
+    inner = max(20, width - 6)
+    lines: List[str] = []
+
+    for raw_line in str(report).splitlines() or [""]:
+        line = _sanitize_text(raw_line).rstrip()
+
+        stripped = line.strip()
+        if not stripped:
+            lines.append("")
+            continue
+
+        # Headings: #, ##, ###
+        heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading:
+            text = _truncate_width(heading.group(2).strip(), inner)
+            if USE_COLOR:
+                lines.append(f"{BOLD}{NEON_CYAN}{text}{RESET}")
+                lines.append(_paint(AURORA_RULE, "─" * min(inner, _display_width(text) + 2)))
+            else:
+                lines.append(text)
+            continue
+
+        # Bullets: -, *, •
+        bullet = re.match(r"^([-*•])\s+(.*)$", stripped)
+        if bullet:
+            body = _style_inline(bullet.group(2))
+            glyph = _paint(AURORA_ORANGE, "▸") if USE_COLOR else "-"
+            wrapped = _wrap_plain(body, inner - 2)
+            for index, segment in enumerate(wrapped):
+                lines.append(f"{glyph} {segment}" if index == 0 else f"  {segment}")
+            continue
+
+        # Numbered items
+        numbered = re.match(r"^(\d+)[.)]\s+(.*)$", stripped)
+        if numbered:
+            body = _style_inline(numbered.group(2))
+            marker = _paint(AURORA_GOLD, f"{numbered.group(1)}.") if USE_COLOR else f"{numbered.group(1)}."
+            wrapped = _wrap_plain(body, inner - 3)
+            for index, segment in enumerate(wrapped):
+                lines.append(f"{marker} {segment}" if index == 0 else f"   {segment}")
+            continue
+
+        lines.extend(_wrap_plain(_style_inline(stripped), inner))
+
+    return lines or [""]
+
+
+def _wrap_plain(text: str, width: int) -> List[str]:
+    """Wrap styled text by measuring display width, preserving ANSI codes."""
+    words = text.split(" ")
+    wrapped: List[str] = []
+    current = ""
+
+    def width_of(value: str) -> int:
+        return _display_width(value)
+
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if width_of(candidate) <= width or not current:
+            current = candidate
+        else:
+            wrapped.append(current)
+            current = word
+
+    if current:
+        wrapped.append(current)
+
+    return wrapped or [""]
+
+
 def print_captain_report(report: str) -> None:
-    """Pretty-print the Captain's textual analysis."""
+    """Pretty-print the Captain's textual analysis with markdown styling."""
     width = min(_terminal_width(), 90)
 
     _emit("")
-    _emit(_c(DARK_GRAY, "╭" + "─" * (width - 2) + "╮"))
+    _emit(_panel_open(width))
     _emit(
-        _c(DARK_GRAY, "│ ")
-        + _c(
-            BOLD + NEON_CYAN,
-            "🧠 CAPTAIN ANALYSIS".center(width - 4),
+        _paint(AURORA_RULE, "│")
+        + _pad(
+            _c(BOLD + NEON_CYAN, "🧠 CAPTAIN ANALYSIS"),
+            width - 2,
+            align="center",
         )
-        + _c(DARK_GRAY, " │")
+        + _paint(AURORA_RULE, "│")
     )
-    _emit(_c(DARK_GRAY, "├" + "─" * (width - 2) + "┤"))
+    _emit(_panel_divider(width))
 
-    for raw_line in str(report).splitlines() or [""]:
-        line = _truncate(_sanitize_text(raw_line), width - 6)
-        _emit(
-            _c(DARK_GRAY, "│ ")
-            + _c(WHITE, line)
-            + " " * max(0, width - len(line) - 4)
-            + _c(DARK_GRAY, "│")
-        )
+    for line in _captain_body_lines(report, width):
+        _emit(_panel_line(line, width))
 
-    _emit(_c(DARK_GRAY, "╰" + "─" * (width - 2) + "╯"))
+    _emit(_panel_close(width))
     _emit("")
 
 
@@ -706,24 +1240,49 @@ def print_captain_advice(
     """Compact v1.1 Captain decision card."""
     _emit(
         f"🧠 {_c(BOLD + NEON_CYAN, 'CAPTAIN')} "
-        f"{_c(GOLD, _sanitize_text(action))}"
+        f"{_paint(AURORA_GOLD, _sanitize_text(action))}"
     )
 
     if multiplier is not None:
+        value = _safe_float(multiplier, 1.0)
+        if value > 1.0:
+            color = AURORA_SUCCESS
+        elif value < 1.0:
+            color = AURORA_WARN
+        else:
+            color = AURORA_TEXT
         _emit(
-            f"   LR multiplier: "
-            f"{_c(BOLD + ORANGE, f'x{float(multiplier):.3f}')}"
+            f"   LR multiplier: {_paint(color, f'x{value:.3f}')}"
         )
 
     if reason:
         _emit(
-            f"   {_c(GRAY, _truncate(reason, _terminal_width() - 6))}"
+            f"   {_c(GRAY, _truncate(_sanitize_text(reason), _terminal_width() - 6))}"
         )
 
 
 # ============================================================================
 # Final summaries
 # ============================================================================
+
+def _leader(label: str, value: str, width: int) -> str:
+    """A metric row with dotted leaders between label and value.
+
+    Label is padded while plain, then styled, so column math stays correct.
+    """
+    label_width = 27
+    label_plain = _truncate_width(label, label_width)
+    value_text = _truncate_width(str(value), max(8, width - label_width - 8))
+    value_width = _display_width(value_text)
+    dots_width = max(3, width - 4 - label_width - value_width)
+
+    return (
+        f"  {_c(BOLD, f'{label_plain:<{label_width}}')}"
+        + _c(DARK_GRAY, "·" * dots_width)
+        + " "
+        + value_text
+    )
+
 
 def print_final_summary(stats: Dict[str, Any]) -> None:
     """Render a beautiful final process summary."""
@@ -733,9 +1292,10 @@ def print_final_summary(stats: Dict[str, Any]) -> None:
     _emit(_c(DARK_GRAY, "╔" + "═" * (width - 2) + "╗"))
     _emit(
         _c(DARK_GRAY, "║ ")
-        + _c(
-            BOLD + NEON_GREEN,
-            "✅ FTRAIN PROCESS COMPLETED".center(width - 4),
+        + _pad(
+            _c(BOLD + NEON_GREEN, "✅ FTRAIN PROCESS COMPLETED"),
+            width - 4,
+            align="center",
         )
         + _c(DARK_GRAY, " ║")
     )
@@ -743,30 +1303,38 @@ def print_final_summary(stats: Dict[str, Any]) -> None:
 
     for key, value in stats.items():
         label = str(key).replace("_", " ").title()
-        display = _sanitize_text(value)
+        label_plain = _truncate_width(label, 27)
 
-        if "http://" in display or "https://" in display:
-            display = _c(NEON_CYAN + "\033[4m", display)
-        elif any(
-            token in label.lower()
-            for token in (
-                "loss",
-                "accuracy",
-                "improvement",
-                "progress",
+        if isinstance(value, float):
+            key_l = key.lower()
+            if any(token in key_l for token in ("improvement", "rate", "ratio", "coverage")):
+                display = f"{value * 100:.2f}%"
+            else:
+                display = _format_metric(value)
+            colored = _paint(AURORA_GOLD, display)
+        elif isinstance(value, bool):
+            colored = _paint(
+                AURORA_SUCCESS if value else AURORA_DANGER,
+                "yes" if value else "no",
             )
-        ):
-            display = _c(GOLD, display)
+        elif isinstance(value, int):
+            colored = _paint(AURORA_TEXT, f"{value:,}")
         else:
-            display = _c(WHITE, display)
+            display = _sanitize_text(value)
+            if "http://" in display or "https://" in display:
+                colored = _c(NEON_CYAN + UNDERLINE, display)
+            else:
+                colored = _c(WHITE, display)
 
-        label_plain = _truncate(label, 27)
-        _emit(
+        row = (
             _c(DARK_GRAY, "║ ")
             + _c(BOLD, f"{label_plain:<27}")
-            + _c(DARK_GRAY, " │ ")
-            + display
+            + " "
+            + _c(DARK_GRAY, "·" * max(3, 28 - len(label_plain)))
+            + " "
+            + colored
         )
+        _emit(row)
 
     _emit(_c(DARK_GRAY, "╚" + "═" * (width - 2) + "╝"))
     _emit("")
@@ -778,48 +1346,48 @@ def print_metric_summary(
     *,
     icon: str = "📊",
 ) -> None:
-    """Generic metric-card renderer."""
+    """Generic metric-card renderer with dotted leaders."""
     width = min(_terminal_width(), 90)
 
     _emit("")
-    _emit(_c(DARK_GRAY, "╭" + "─" * (width - 2) + "╮"))
-    _emit(
-        _c(DARK_GRAY, "│ ")
-        + _c(BOLD + NEON_CYAN, f"{icon} {title}")
-        + " " * max(0, width - len(_sanitize_text(title)) - 7)
-        + _c(DARK_GRAY, "│")
-    )
-    _emit(_c(DARK_GRAY, "├" + "─" * (width - 2) + "┤"))
+    _emit(_panel_open(width))
+    _emit(_panel_title(title, width, icon=icon))
+    _emit(_panel_divider(width))
 
     for key, value in metrics.items():
         label = str(key).replace("_", " ").title()
-        if isinstance(value, float):
+        label_text = _truncate_width(label, 25)
+
+        color, formatted = _value_color(key, value)
+        if formatted is not None:
+            display = formatted
+        elif isinstance(value, float):
             if "rate" in key.lower() or "ratio" in key.lower():
                 display = f"{value:.2%}"
             else:
                 display = f"{value:.5f}"
         else:
-            display = str(value)
+            display = _format_value(value)
 
-        line = (
-            f"  {_c(BOLD, _truncate(label, 25))}"
-            f"{' ' * max(1, 27 - len(_truncate(label, 25)))}"
-            f"{_c(NEON_CYAN, _truncate(display, width - 31))}"
+        row = (
+            f"  {_c(BOLD, label_text)}"
+            + " "
+            + _c(DARK_GRAY, "·" * max(3, 26 - len(label_text)))
+            + " "
+            + _paint(color, _truncate_width(_sanitize_text(display), width - 36))
         )
 
-        _emit(
-            _c(DARK_GRAY, "│")
-            + line
-            + " " * max(0, width - len(_sanitize_text(line)) - 1)
-            + _c(DARK_GRAY, "│")
-        )
+        _emit(_panel_line(row, width))
 
-    _emit(_c(DARK_GRAY, "╰" + "─" * (width - 2) + "╯"))
+    _emit(_panel_close(width))
 
 
 # ============================================================================
 # Loading bar
 # ============================================================================
+
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
 
 class LoadingBar:
     """
@@ -831,7 +1399,8 @@ class LoadingBar:
         update(current, total)
         done()
 
-    ``real_progress=False`` creates an animated indeterminate bar.
+    ``real_progress=False`` creates an animated indeterminate bar with a
+    braille spinner and a live elapsed-time readout.
     """
 
     def __init__(
@@ -850,6 +1419,7 @@ class LoadingBar:
         self.stop_event = threading.Event()
         self._progress = 0.0
         self._running = False
+        self._start_time: Optional[float] = None
         self.thread: Optional[threading.Thread] = None
 
     def __enter__(self):
@@ -868,12 +1438,14 @@ class LoadingBar:
             return
 
         self._running = True
+        self._start_time = time.monotonic()
         self.stop_event.clear()
 
         if self.real:
             _rewrite(
                 f"📦 {_c(BOLD, self.message)} "
-                f"{gradient_bar(0.0, self.width, from_blue_to_orange=True)} 0.0%"
+                f"{gradient_bar(0.0, self.width, from_blue_to_orange=True)} "
+                f"{_paint(AURORA_MUTED, '0.00%')}"
             )
             return
 
@@ -887,26 +1459,32 @@ class LoadingBar:
     def _run(self) -> None:
         position = 0
         direction = 1
+        frame = 0
 
         while not self.stop_event.is_set():
+            frame += 1
             position += direction
 
-            if position >= self.width - 1:
-                position = self.width - 1
+            if position >= self.width - 2:
+                position = self.width - 2
                 direction = -1
 
             elif position <= 0:
                 position = 0
                 direction = 1
 
+            elapsed = max(0.0, time.monotonic() - (self._start_time or time.monotonic()))
+
             if USE_COLOR:
-                bar = (
-                    "["
-                    + _c(BG_BLUE, " " * position)
-                    + _c(BG_ORANGE, "██")
-                    + _c(BG_GRAY, " " * max(0, self.width - position - 2))
-                    + "]"
-                )
+                trail: List[str] = []
+                for index in range(self.width):
+                    if index == position:
+                        trail.append(f"{_bg(AURORA_ORANGE)}  ")
+                    elif abs(index - position) == 1:
+                        trail.append(f"{_bg(_blend(AURORA_ORANGE, AURORA_TRACK, 0.5))}  ")
+                    else:
+                        trail.append(f"{_bg(AURORA_TRACK)}  ")
+                bar = "".join(trail) + RESET
             else:
                 bar = (
                     "["
@@ -916,14 +1494,20 @@ class LoadingBar:
                     + "]"
                 )
 
-            _rewrite(
-                f"📦 {_c(BOLD, self.message)} "
-                f"{bar} {_c(GOLD, 'working…')}"
+            spinner = SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
+            spinner_part = _paint(AURORA_GOLD, spinner) if USE_COLOR else ""
+            elapsed_part = (
+                _paint(AURORA_MUTED, _format_duration(elapsed))
+                if USE_COLOR
+                else _format_duration(elapsed)
             )
 
-            self.stop_event.wait(
-                self.update_interval
+            _rewrite(
+                f"📦 {_c(BOLD, self.message)} {bar} "
+                f"{spinner_part} {elapsed_part}"
             )
+
+            self.stop_event.wait(self.update_interval)
 
     def update(self, current, total) -> None:
         try:
@@ -945,10 +1529,12 @@ class LoadingBar:
 
         self._progress = progress
 
+        elapsed = max(0.0, time.monotonic() - (self._start_time or time.monotonic()))
         _rewrite(
             f"📦 {_c(BOLD, self.message)} "
             f"{gradient_bar(progress, self.width, from_blue_to_orange=True)} "
-            f"{progress * 100:6.2f}%"
+            f"{_paint(_milestone_color(progress), f'{progress * 100:6.2f}%')} "
+            f"{_paint(AURORA_MUTED, _format_duration(elapsed))}"
         )
 
     def done(self) -> None:
@@ -968,10 +1554,17 @@ class LoadingBar:
         self.thread = None
         self._running = False
 
+        elapsed = max(0.0, time.monotonic() - (self._start_time or time.monotonic()))
+        duration = (
+            f" {_paint(AURORA_MUTED, '(' + _format_duration(elapsed) + ')')}"
+            if USE_COLOR
+            else f" ({_format_duration(elapsed)})"
+        )
+
         _rewrite(
             f"📦 {_c(BOLD, self.message)} "
             f"{gradient_bar(1.0, self.width, from_blue_to_orange=True)} "
-            f"{_c(BOLD + NEON_GREEN, '100.00%')} ✅"
+            f"{_c(BOLD + NEON_GREEN, '100.00%')} ✅{duration}"
         )
 
         with _OUTPUT_LOCK:
@@ -985,6 +1578,24 @@ class LoadingBar:
 # ============================================================================
 # Convenience helpers for the enhanced FTRAIN core
 # ============================================================================
+
+def print_divider(label: str = "", char: str = "─") -> None:
+    """A dim divider line, optionally centered around a label. (New in v1.2.)"""
+    width = _terminal_width()
+    label_text = f" {_sanitize_text(label)} " if label else ""
+
+    if not label_text:
+        _emit(_rule(width, char))
+        return
+
+    label_width = _display_width(label_text)
+    side = max(2, (width - label_width) // 2)
+    _emit(
+        _c(DARK_GRAY, char * side)
+        + _c(DIM + GRAY, label_text)
+        + _c(DARK_GRAY, char * max(2, width - side - label_width))
+    )
+
 
 def print_model_info(
     *,
@@ -1000,7 +1611,7 @@ def print_model_info(
     metrics: Dict[str, Any] = {}
 
     if model_name is not None:
-        metrics["Model"] = _truncate(model_name, 58)
+        metrics["Model"] = _truncate_width(_sanitize_text(model_name), 58)
     if family is not None:
         metrics["Family"] = family
     if parameters is not None:
@@ -1106,6 +1717,12 @@ def _strip_ansi(value: str) -> str:
 __all__ = [
     "CLEAR_LINE",
     "RESET",
+    "BOLD",
+    "DIM",
+    "ITALIC",
+    "UNDERLINE",
+    "USE_COLOR",
+    "USE_TRUECOLOR",
     "fire_header",
     "gradient_bar",
     "print_train_table",
@@ -1120,6 +1737,6 @@ __all__ = [
     "print_training_result",
     "print_stage",
     "print_status",
+    "print_divider",
     "LoadingBar",
-    "USE_COLOR",
 ]
