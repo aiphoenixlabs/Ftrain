@@ -34,7 +34,72 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from unsloth import FastLanguageModel
+try:
+    from unsloth import FastLanguageModel
+
+    _UNSLOTH_OK = True
+except Exception:  # Mac/ROCm/XPU/CPU hosts have no unsloth
+    FastLanguageModel = None
+    _UNSLOTH_OK = False
+
+    try:
+        from transformers import (
+            AutoModelForCausalLM as _TFModel,
+            AutoTokenizer as _TFTokenizer,
+        )
+    except Exception:
+        _TFModel = None
+        _TFTokenizer = None
+
+
+def _load_model_any(model_name, **kwargs):
+    """Load a model for merge-time work on any platform.
+
+    Uses Unsloth (NVIDIA) when available; otherwise falls back to
+    Transformers, stripping Unsloth-only kwargs. 4-bit loading in the
+    Transformers path requires bitsandbytes and is skipped with a clear
+    warning otherwise.
+    """
+    if _UNSLOTH_OK:
+        return FastLanguageModel.from_pretrained(model_name, **kwargs)
+
+    if _TFModel is None:
+        raise RuntimeError(
+            "FTRAIN merge requires either 'unsloth' or 'transformers' to "
+            "load models; neither is importable on this machine."
+        )
+
+    load_kwargs = dict(kwargs)
+    load_in_4bit = load_kwargs.pop("load_in_4bit", False)
+    dtype = load_kwargs.pop("dtype", None)
+    load_kwargs.pop("max_seq_length", None)
+    load_kwargs.pop("attn_implementation", None)
+    device_map = load_kwargs.pop("device_map", None)
+
+    if load_in_4bit:
+        try:
+            import bitsandbytes  # noqa: F401
+            from transformers import BitsAndBytesConfig
+
+            load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True
+            )
+            if device_map:
+                load_kwargs["device_map"] = device_map
+        except Exception:
+            logger.warning(
+                "load_in_4bit requested but bitsandbytes is unavailable; "
+                "loading the model in its default precision instead."
+            )
+    elif device_map:
+        load_kwargs["device_map"] = device_map
+
+    if dtype is not None:
+        load_kwargs["torch_dtype"] = dtype
+
+    model = _TFModel.from_pretrained(model_name, **load_kwargs)
+    tokenizer = _TFTokenizer.from_pretrained(model_name)
+    return model, tokenizer
 
 from . import ui
 from .merge_intel import MergeAnalyzer, MergePlanner
@@ -86,6 +151,25 @@ class Merger:
 
         self.strategy = getattr(config, "strategy", "intelligent")
         self.alpha = float(getattr(config, "alpha", 0.5))
+
+        # ----------------------------------------------------
+        # CBA — Captain Brain Alignment
+        # ----------------------------------------------------
+
+        self.use_cba = bool(getattr(config, "use_cba", False))
+        if self.strategy == "cba":
+            self.strategy = "intelligent"
+            self.use_cba = True
+
+        self.cba_conflict_threshold = float(
+            getattr(config, "cba_conflict_threshold", 0.65)
+        )
+
+        self.cba_fallback = str(
+            getattr(config, "cba_fallback", "abort")
+        )
+
+        self._cba_report = None
 
         save_dtype = getattr(config, "save_dtype", "bf16")
 
@@ -1113,6 +1197,7 @@ class Merger:
         fisher_b=None,
         analyzer=None,
         planner=None,
+        cba_directive=None,
     ):
 
         # ----------------------------------------------------
@@ -1208,6 +1293,32 @@ class Merger:
             return b
 
         # ----------------------------------------------------
+        # CBA routing (Captain Brain Alignment)
+        #
+        # CBA only refines the intelligent plan: it re-weights
+        # "weighted" merges with per-layer evidence and redirects
+        # conflicted tensors to sign-consensus. Explicit user
+        # strategies and the planner's critical-tensor decisions
+        # (keep_a / keep_b) are never overridden.
+        # ----------------------------------------------------
+
+        if cba_directive is not None:
+
+            if (
+                cba_directive.action == "ties"
+                and plan.strategy in ("weighted", "slerp")
+            ):
+                return fast_ties(
+                    a,
+                    b,
+                )
+
+            if plan.strategy == "weighted":
+                plan.alpha = float(
+                    cba_directive.alpha_a
+                )
+
+        # ----------------------------------------------------
         # Weighted
         # ----------------------------------------------------
 
@@ -1292,11 +1403,38 @@ class Merger:
 
         ui.fire_header()
 
-        device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
+        from .hardware import best_device
+
+        device = best_device()
+
+        if bool(getattr(self.config, "maximum_power", False)):
+            try:
+                from . import hardware
+                from .hardware import apply_maximum_power, maximum_power_plan
+
+                profile = hardware.detect()
+
+                plan = maximum_power_plan(
+                    profile,
+                    training=False,
+                )
+                apply_maximum_power(plan)
+
+                ui.print_stage(
+                    "MAXIMUM POWER ENGAGED",
+                    profile.summary(),
+                    icon="⚡",
+                    status="DONE",
+                )
+
+                for warning in plan.get("warnings", []):
+                    ui.print_status(warning, level="warning")
+
+            except Exception:
+                logger.debug(
+                    "maximum_power (merge) failed; continuing normally.",
+                    exc_info=True,
+                )
 
         print(
             "\n🔥 FTRAIN INTELLIGENT BRAIN MERGE"
@@ -1338,7 +1476,7 @@ class Merger:
                 )
 
                 _, temp_tok = (
-                    FastLanguageModel.from_pretrained(
+                    _load_model_any(
                         self.model_a,
                         load_in_4bit=True,
                     )
@@ -1404,7 +1542,7 @@ class Merger:
                 )
 
                 m1_temp, _ = (
-                    FastLanguageModel.from_pretrained(
+                    _load_model_any(
                         self.model_a,
                         load_in_4bit=False,
                         dtype=torch.float16,
@@ -1425,7 +1563,7 @@ class Merger:
                 )
 
                 m2_temp, _ = (
-                    FastLanguageModel.from_pretrained(
+                    _load_model_any(
                         self.model_b,
                         load_in_4bit=False,
                         dtype=torch.float16,
@@ -1466,7 +1604,7 @@ class Merger:
         bar.start()
 
         model1, tokenizer = (
-            FastLanguageModel.from_pretrained(
+            _load_model_any(
                 self.model_a,
                 load_in_4bit=False,
                 dtype=torch.float16,
@@ -1499,7 +1637,7 @@ class Merger:
         bar.start()
 
         model2, _ = (
-            FastLanguageModel.from_pretrained(
+            _load_model_any(
                 self.model_b,
                 load_in_4bit=False,
                 dtype=torch.float16,
@@ -1548,6 +1686,93 @@ class Merger:
             k: v.clone().to(torch.float16)
             for k, v in sd1.items()
         }
+
+        # ====================================================
+        # STEP 5.5
+        # CBA — CAPTAIN BRAIN ALIGNMENT
+        # ====================================================
+
+        self._cba_report = None
+
+        if self.use_cba:
+
+            print(
+                "\n🧠 CBA — Captain Brain Alignment..."
+            )
+
+            try:
+
+                from .cba import run_cba
+
+                self._cba_report = run_cba(
+                    sd1,
+                    sd2,
+                    high_conflict_threshold=(
+                        self.cba_conflict_threshold
+                    ),
+                )
+
+                cba_compat = self._cba_report.compatibility
+                cba_conflicts = self._cba_report.conflicts
+                routing = self._cba_report.routing
+                decision = self._cba_report.decision
+
+                print(
+                    f"   Mergeability: {cba_compat.mergeability:.0f}/100"
+                )
+
+                print(
+                    f"   Global conflict: "
+                    f"{cba_conflicts.global_score:.2f} "
+                    f"({cba_conflicts.global_band})"
+                )
+
+                print(
+                    f"   Routing favors {routing.dominant_model} "
+                    f"(confidence {decision.confidence:.0%})"
+                )
+
+                for line in (
+                    routing.alpha_summary().splitlines()[:12]
+                ):
+                    print(f"   {line}")
+
+                print(
+                    f"   WHAT: {decision.questions['what']}"
+                )
+
+                print(
+                    f"   WHY: {decision.questions['why']}"
+                )
+
+                print(
+                    f"   NEXT: {decision.questions['next']}"
+                )
+
+                if cba_conflicts.high_conflict_layers:
+                    print(
+                        "   ⚔️ High-conflict groups routed to "
+                        f"sign-consensus: "
+                        f"{', '.join(cba_conflicts.high_conflict_layers[:5])}"
+                    )
+
+            except Exception as cba_error:
+
+                if self.cba_fallback == "abort":
+
+                    raise RuntimeError(
+                        "CBA analysis failed and "
+                        "MergeConfig.cba_fallback='abort'. FTRAIN refuses "
+                        "to silently average models when CBA was requested. "
+                        "Fix the underlying issue or set "
+                        "cba_fallback='intelligent' explicitly."
+                    ) from cba_error
+
+                logger.warning(
+                    "CBA failed; continuing with the standard "
+                    "intelligent merge as explicitly configured: %s",
+                    cba_error,
+                )
 
         # ====================================================
         # STEP 6
@@ -1648,6 +1873,13 @@ class Merger:
                     fisher_b=fisher_b,
                     analyzer=analyzer,
                     planner=planner,
+                    cba_directive=(
+                        self._cba_report.routing.directives.get(
+                            key_a
+                        )
+                        if self._cba_report is not None
+                        else None
+                    ),
                 )
 
             except Exception as e:
@@ -1731,7 +1963,7 @@ class Merger:
         )
 
         merged_model, tokenizer = (
-            FastLanguageModel.from_pretrained(
+            _load_model_any(
                 self.model_a,
                 load_in_4bit=False,
                 dtype=self.dtype,
