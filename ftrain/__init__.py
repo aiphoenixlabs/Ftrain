@@ -6,7 +6,7 @@ from typing import Final
 
 from .api import merge, test, train
 
-__version__: Final[str] = "1.1.0"
+__version__: Final[str] = "1.2.0"
 __author__: Final[str] = "FTRAIN Engine Team"
 
 # Public package surface.
