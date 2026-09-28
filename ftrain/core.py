@@ -109,6 +109,167 @@ def _is_finite(
         return False
 
 
+def _bool_config(
+    config: Any,
+    *names: str,
+    default: bool = False,
+) -> bool:
+    """Read a boolean config option without requiring a new TrainConfig field."""
+    for name in names:
+        if hasattr(config, name):
+            try:
+                return bool(getattr(config, name))
+            except Exception:
+                continue
+    return default
+
+
+def _string_config(
+    config: Any,
+    *names: str,
+    default: str = "",
+) -> str:
+    """Read a string config option without coupling core.py to one config version."""
+    for name in names:
+        if hasattr(config, name):
+            try:
+                value = getattr(config, name)
+                if value is None:
+                    continue
+                value = str(value).strip()
+                if value:
+                    return value
+            except Exception:
+                continue
+    return default
+
+
+def _hardware_snapshot() -> Dict[str, Any]:
+    """Return a cheap, JSON-safe snapshot of the current compute hardware."""
+    result: Dict[str, Any] = {
+        "cuda": False,
+        "gpu_count": 0,
+        "gpus": [],
+        "bf16_supported": False,
+        "recommended_precision": "fp32",
+        "recommended_backend": "transformers",
+    }
+
+    try:
+        result["cuda"] = bool(torch.cuda.is_available())
+    except Exception:
+        return result
+
+    if not result["cuda"]:
+        return result
+
+    try:
+        count = int(torch.cuda.device_count())
+    except Exception:
+        count = 1
+
+    result["gpu_count"] = max(0, count)
+
+    try:
+        result["bf16_supported"] = bool(torch.cuda.is_bf16_supported())
+    except Exception:
+        result["bf16_supported"] = False
+
+    result["recommended_precision"] = (
+        "bf16" if result["bf16_supported"] else "fp16"
+    )
+    result["recommended_backend"] = (
+        "unsloth" if UNSLOTH_AVAILABLE else "transformers"
+    )
+
+    for index in range(result["gpu_count"]):
+        item: Dict[str, Any] = {"index": index}
+
+        try:
+            item["name"] = torch.cuda.get_device_name(index)
+        except Exception:
+            item["name"] = "unknown"
+
+        try:
+            total, free = torch.cuda.mem_get_info(index)
+            item["total_vram_gb"] = round(total / (1024**3), 2)
+            item["free_vram_gb"] = round(free / (1024**3), 2)
+        except Exception:
+            item["total_vram_gb"] = None
+            item["free_vram_gb"] = None
+
+        result["gpus"].append(item)
+
+    return result
+
+
+def _json_load_if_exists(path: Path) -> Optional[Any]:
+    """Best-effort JSON loader used only for local FTRAIN reports."""
+    try:
+        if not path.is_file():
+            return None
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+
+def _walk_mapping(
+    value: Any,
+    *,
+    max_depth: int = 4,
+    _depth: int = 0,
+) -> Iterable[Mapping[str, Any]]:
+    """Yield nested mappings from a JSON document, bounded for safety."""
+    if _depth > max_depth:
+        return
+    if isinstance(value, Mapping):
+        yield value
+        for child in value.values():
+            yield from _walk_mapping(child, max_depth=max_depth, _depth=_depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _walk_mapping(child, max_depth=max_depth, _depth=_depth + 1)
+
+
+def _find_first_mapping_value(
+    root: Any,
+    keys: Sequence[str],
+) -> Any:
+    wanted = {key.lower() for key in keys}
+    for mapping in _walk_mapping(root):
+        for key, value in mapping.items():
+            if str(key).lower() in wanted:
+                return value
+    return None
+
+
+def _cleanup_publish_staging(output_dir: Path) -> List[str]:
+    """Remove only publication staging artifacts; never delete the trained model."""
+    removed: List[str] = []
+    candidates = (
+        output_dir / "hf_publish_staging",
+        output_dir / "huggingface_upload",
+        output_dir / ".hf_publish",
+        output_dir / "publish_staging",
+        output_dir / "hub_upload_manifest.json",
+        output_dir / "publish_manifest.json",
+    )
+
+    for target in candidates:
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+                removed.append(str(target))
+            elif target.is_file():
+                target.unlink()
+                removed.append(str(target))
+        except OSError:
+            logger.debug("FTRAIN: unable to remove publish staging %s", target, exc_info=True)
+
+    return removed
+
+
 # =============================================================================
 # FTRAIN
 # =============================================================================
@@ -184,6 +345,14 @@ class Ftrain:
         self._scaler = None
         self._trainer = None
         self._backend = "none"
+        self._backend_reason = "not-selected"
+        self._hardware: Dict[str, Any] = {}
+        self._publish_state: Dict[str, Any] = {
+            "requested": False,
+            "approved": False,
+            "blocked": False,
+            "reason": "not-evaluated",
+        }
 
         self.model: Optional[torch.nn.Module] = None
         self.tokenizer: Any = None
@@ -441,6 +610,402 @@ class Ftrain:
 
         return self.device
 
+    def _refresh_hardware_profile(self) -> Dict[str, Any]:
+        """Detect hardware once and expose conservative execution recommendations."""
+        profile = _hardware_snapshot()
+        profile["device"] = str(self.device)
+        profile["world_size"] = int(self._world_size)
+        profile["local_rank"] = int(self._local_rank)
+        profile["distributed"] = bool(self._distributed)
+        profile["single_process"] = not bool(self._distributed)
+
+        if profile.get("cuda"):
+            gpu_names = [
+                str(item.get("name", "unknown"))
+                for item in profile.get("gpus", [])
+            ]
+            profile["is_t4"] = any("T4" in name.upper() for name in gpu_names)
+            profile["is_ampere_or_newer"] = any(
+                any(marker in name.upper() for marker in ("A100", "A10", "A30", "A40", "L4", "L40", "H100", "H200", "B100", "B200"))
+                for name in gpu_names
+            )
+        else:
+            profile["is_t4"] = False
+            profile["is_ampere_or_newer"] = False
+
+        # A notebook with multiple visible GPUs is NOT automatically a sharded
+        # training job. Keep one coherent GPU unless a real multi-process job
+        # exists. This is the safe behavior for Kaggle's common 2x-T4 setup.
+        if profile.get("gpu_count", 0) >= 2 and not self._distributed:
+            profile["training_gpu_policy"] = "single_gpu_notebook"
+        elif self._distributed:
+            profile["training_gpu_policy"] = "distributed_local_rank"
+        else:
+            profile["training_gpu_policy"] = "single_device"
+
+        self._hardware = profile
+        return profile
+
+    def _select_backend_for_hardware(self) -> str:
+        """Choose the fastest compatible training backend without unsafe surprises."""
+        cfg = self.config
+        profile = self._refresh_hardware_profile()
+
+        # Explicit opt-out remains authoritative.
+        if _bool_config(cfg, "disable_unsloth", default=False):
+            if hasattr(cfg, "use_hf_trainer"):
+                cfg.use_hf_trainer = True
+            if hasattr(cfg, "use_unsloth_trainer"):
+                cfg.use_unsloth_trainer = False
+            self._backend_reason = "Unsloth explicitly disabled"
+            return "transformers"
+
+        # Auto mode is intentionally enabled when the config does not contain
+        # a dedicated switch. Existing configs therefore benefit from Unsloth
+        # without needing a breaking TrainConfig change.
+        auto_unsloth = _bool_config(
+            cfg,
+            "auto_use_unsloth",
+            "use_unsloth_auto",
+            default=True,
+        )
+
+        if (
+            auto_unsloth
+            and UNSLOTH_AVAILABLE
+            and self.device.type == "cuda"
+            and not self.config.use_grpo
+        ):
+            if hasattr(cfg, "use_hf_trainer"):
+                cfg.use_hf_trainer = True
+            if hasattr(cfg, "use_unsloth_trainer"):
+                cfg.use_unsloth_trainer = True
+
+            self._backend_reason = (
+                "CUDA detected and Unsloth is available; "
+                f"selected Unsloth for {profile.get('recommended_precision', 'fp16')}"
+            )
+            return "unsloth"
+
+        if self.config.use_grpo:
+            self._backend_reason = "GRPO selected"
+            return "grpo"
+
+        if getattr(cfg, "use_hf_trainer", False):
+            self._backend_reason = "HF trainer requested or required"
+            return "transformers"
+
+        self._backend_reason = "custom trainer requested"
+        return "custom"
+
+    def hardware_info(self) -> Dict[str, Any]:
+        """Return a copy of FTRAIN's current hardware profile."""
+        return dict(self._hardware or self._refresh_hardware_profile())
+
+    def backend_info(self) -> Dict[str, Any]:
+        """Return backend selection details suitable for logs/telemetry."""
+        return {
+            "backend": self._backend,
+            "reason": self._backend_reason,
+            "unsloth_available": bool(UNSLOTH_AVAILABLE),
+            "hardware": self.hardware_info(),
+        }
+
+    def _merge_publish_candidates(self) -> List[Path]:
+        """Locate merger/CBA reports without requiring a specific merger version."""
+        root = Path(self.config.output_dir).expanduser()
+        candidates: List[Path] = []
+
+        names = (
+            "merge_report.json",
+            "ftrain_merge_report.json",
+            "merge_decision.json",
+            "ftrain_merge_decision.json",
+            "cba_report.json",
+            "ftrain_cba_report.json",
+            "merge_metadata.json",
+            "merge_config.json",
+            "ftrain_merge_config.json",
+            "config.json",
+        )
+
+        for directory in (root, root / "final", root / "reports"):
+            for name in names:
+                path = directory / name
+                if path.is_file():
+                    candidates.append(path)
+
+        # Keep a bounded recursive search. We do not scan arbitrary user files.
+        for path in root.glob("**/*merge*.json"):
+            if len(candidates) >= 20:
+                break
+            if path.is_file() and path not in candidates:
+                candidates.append(path)
+
+        return candidates[:20]
+
+    def _read_merge_publication_verdict(self) -> Dict[str, Any]:
+        """Read a merger's publication verdict/quality gate from local JSON reports."""
+        reports: List[Tuple[Path, Any]] = []
+        for path in self._merge_publish_candidates():
+            payload = _json_load_if_exists(path)
+            if payload is not None:
+                reports.append((path, payload))
+
+        explicit_deny = False
+        explicit_allow = False
+        deny_reasons: List[str] = []
+        evidence: List[str] = []
+        best_quality: Dict[str, Any] = {}
+
+        deny_keys = {
+            "publish_to_hub": False,
+            "publish": False,
+            "should_publish": False,
+            "approved_for_publication": False,
+            "publish_approved": False,
+            "hugging": False,
+        }
+
+        allow_words = {"approve", "approved", "allow", "allowed", "publish", "yes", "true"}
+        deny_words = {"deny", "denied", "reject", "rejected", "do_not_publish", "not_publish", "no", "false"}
+
+        for path, payload in reports:
+            evidence.append(path.name)
+            best_quality[path.name] = payload if isinstance(payload, Mapping) else str(type(payload).__name__)
+
+            for mapping in _walk_mapping(payload):
+                for key, value in mapping.items():
+                    k = str(key).strip().lower()
+                    if k in deny_keys:
+                        if isinstance(value, bool):
+                            if value:
+                                explicit_allow = True
+                            else:
+                                explicit_deny = True
+                                deny_reasons.append(f"{path.name}:{k}=false")
+                        else:
+                            normalized = str(value).strip().lower()
+                            if normalized in allow_words:
+                                explicit_allow = True
+                            elif normalized in deny_words:
+                                explicit_deny = True
+                                deny_reasons.append(f"{path.name}:{k}={value}")
+
+                    if k in {"publish_decision", "publication_decision", "hub_decision"}:
+                        normalized = str(value).strip().lower()
+                        if normalized in allow_words:
+                            explicit_allow = True
+                        elif normalized in deny_words:
+                            explicit_deny = True
+                            deny_reasons.append(f"{path.name}:{k}={value}")
+
+                    if k in {"risk", "status", "result", "decision"}:
+                        normalized = str(value).strip().lower()
+                        if any(word in normalized for word in ("critical", "unsafe", "reject", "failed", "failure", "do_not_publish")):
+                            explicit_deny = True
+                            deny_reasons.append(f"{path.name}:{k}={value}")
+
+                    if k in {"mergeability", "mergeability_score", "quality_score"}:
+                        number = _safe_float(value, -1.0)
+                        if number >= 0:
+                            best_quality[f"{path.name}:{k}"] = number
+                            minimum = _safe_float(
+                                getattr(self.config, "min_publish_mergeability", 60.0),
+                                60.0,
+                            )
+                            if number < minimum:
+                                explicit_deny = True
+                                deny_reasons.append(
+                                    f"{path.name}:{k}={number:g}<publish-minimum={minimum:g}"
+                                )
+
+                    if k in {"benchmark_regression", "regression", "unsafe_merge"}:
+                        if bool(value):
+                            explicit_deny = True
+                            deny_reasons.append(f"{path.name}:{k}=true")
+
+        return {
+            "explicit_allow": explicit_allow,
+            "explicit_deny": explicit_deny,
+            "deny_reasons": deny_reasons[:20],
+            "reports": evidence,
+            "quality": best_quality,
+        }
+
+    def _publish_requested(self) -> bool:
+        return _bool_config(
+            self.config,
+            "auto_publish_to_hub",
+            "publish_to_hub",
+            "push_to_hub",
+            "hub_publish",
+            "hugging",
+            default=False,
+        )
+
+    def _should_publish_model(self) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Conservative publication gate.
+
+        Rules:
+        - Publication is opt-in.
+        - An explicit merger/CBA denial always wins.
+        - Without explicit approval, automatic publication is blocked.
+        - Critical/unsafe/regression evidence blocks publication.
+        - The trained/final model is retained locally even when publishing is blocked.
+        """
+        requested = self._publish_requested()
+        if not requested:
+            return False, "publication is not enabled", {
+                "requested": False,
+                "approved": False,
+                "blocked": False,
+            }
+
+        verdict = self._read_merge_publication_verdict()
+
+        if verdict["explicit_deny"]:
+            return False, (
+                "merger/CBA publication gate denied this model: "
+                + "; ".join(verdict["deny_reasons"][:6])
+            ), verdict
+
+        if not verdict["explicit_allow"]:
+            return False, (
+                "automatic Hugging Face publication blocked because "
+                "no explicit merger/CBA publication approval was found"
+            ), verdict
+
+        # Optional training-level quality checks.
+        final_val = self._last_val_loss
+        best_val = self._best_val_loss
+        if final_val is not None and best_val is not None:
+            tolerance = _safe_float(
+                getattr(self.config, "publish_val_regression_tolerance", 0.10),
+                0.10,
+            )
+            if final_val > best_val * (1.0 + max(0.0, tolerance)):
+                return False, (
+                    f"final validation loss regressed from best ({best_val:.6g}) "
+                    f"to {final_val:.6g}"
+                ), verdict
+
+        return True, "explicit publication approval passed", verdict
+
+    def _write_publish_decision(
+        self,
+        *,
+        approved: bool,
+        reason: str,
+        verdict: Mapping[str, Any],
+    ) -> None:
+        root = Path(self.config.output_dir).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        self._publish_state = {
+            "requested": self._publish_requested(),
+            "approved": bool(approved),
+            "blocked": bool(self._publish_requested() and not approved),
+            "reason": reason,
+            "backend": self._backend,
+            "merger_verdict": dict(verdict),
+        }
+        try:
+            with (root / "ftrain_publish_decision.json").open("w", encoding="utf-8") as handle:
+                json.dump(self._publish_state, handle, indent=2, ensure_ascii=False, default=str)
+        except OSError:
+            logger.debug("FTRAIN: failed to write publication decision.", exc_info=True)
+
+    def publish_final_to_hub(
+        self,
+        repo_id: Optional[str] = None,
+        *,
+        private: bool = False,
+        token: Optional[str] = None,
+    ) -> bool:
+        """
+        Explicitly publish the final model after the merger/CBA safety gate passes.
+
+        This method never publishes merely because a token exists. It requires:
+        1. an enabled publication flag,
+        2. explicit merger/CBA approval,
+        3. a final model directory.
+        """
+        allowed, reason, verdict = self._should_publish_model()
+        self._write_publish_decision(
+            approved=allowed,
+            reason=reason,
+            verdict=verdict,
+        )
+
+        final_path = (
+            Path(self.config.output_dir).expanduser()
+            / "final"
+        )
+
+        if not allowed:
+            removed = _cleanup_publish_staging(
+                Path(self.config.output_dir).expanduser()
+            )
+            if removed:
+                logger.info("FTRAIN: publication staging removed after block: %s", removed)
+            logger.warning("FTRAIN: Hugging Face publication blocked: %s", reason)
+            return False
+
+        if not final_path.is_dir():
+            logger.warning("FTRAIN: publication blocked; final model directory does not exist: %s", final_path)
+            return False
+
+        target_repo = (
+            repo_id
+            or _string_config(
+                self.config,
+                "hub_repo_id",
+                "repo_id",
+                "hugging_repo_id",
+                default="",
+            )
+        )
+        if not target_repo:
+            logger.warning("FTRAIN: publication blocked; no Hugging Face repo_id was provided.")
+            return False
+
+        effective_token = (
+            token
+            or _string_config(
+                self.config,
+                "hugging_token",
+                "hf_token",
+                "hub_token",
+                default="",
+            )
+            or os.environ.get("HF_TOKEN", "")
+            or os.environ.get("HUGGINGFACE_HUB_TOKEN", "")
+        )
+
+        try:
+            if self.model is None:
+                raise RuntimeError("No trained model is loaded.")
+
+            push_kwargs: Dict[str, Any] = {
+                "repo_id": target_repo,
+                "private": bool(private),
+            }
+            if effective_token:
+                push_kwargs["token"] = effective_token
+
+            self.model.push_to_hub(**push_kwargs)
+
+            if self.tokenizer is not None and hasattr(self.tokenizer, "push_to_hub"):
+                self.tokenizer.push_to_hub(**push_kwargs)
+
+            logger.info("FTRAIN: final model published to %s", target_repo)
+            return True
+
+        except Exception as exc:
+            logger.warning("FTRAIN: Hugging Face publication failed: %s", exc)
+            return False
+
     def _configure_runtime(self) -> None:
         try:
             flash_mode(
@@ -608,6 +1173,8 @@ class Ftrain:
         bar.start()
 
         try:
+            profile = self._refresh_hardware_profile()
+
             kwargs: Dict[str, Any] = {
                 "model_name": cfg.model_name,
                 "max_seq_length": cfg.max_seq_length,
@@ -616,6 +1183,11 @@ class Ftrain:
 
             if not cfg.load_in_4bit:
                 kwargs["dtype"] = self._preferred_model_dtype()
+
+            # T4s are FP16-oriented. Never force BF16 just because a newer
+            # CUDA stack happens to expose a BF16 code path.
+            if profile.get("is_t4") and "dtype" in kwargs:
+                kwargs["dtype"] = torch.float16
 
             attention_impl = self.preset.get("attn_implementation")
             if attention_impl:
@@ -1108,6 +1680,21 @@ class Ftrain:
                 supported = self._supported_parameters(
                     fn
                 )
+
+                # Unsloth has specialized gradient-checkpointing paths on
+                # supported CUDA hardware. Only pass the option when the
+                # installed Unsloth version actually accepts it.
+                if (
+                    getattr(cfg, "gradient_checkpointing_enable", False)
+                    and "use_gradient_checkpointing" in supported
+                ):
+                    kwargs["use_gradient_checkpointing"] = "unsloth"
+
+                if "random_state" in supported:
+                    kwargs["random_state"] = int(getattr(cfg, "seed", 3407))
+
+                if "max_seq_length" in supported:
+                    kwargs["max_seq_length"] = int(getattr(cfg, "max_seq_length", 512))
 
                 if (
                     cfg.use_dora
@@ -1974,6 +2561,14 @@ class Ftrain:
                 cfg.seed
             ),
             "group_by_length": False,
+            "tf32": bool(self.device.type == "cuda"),
+            "dataloader_pin_memory": bool(
+                getattr(cfg, "pin_memory", False)
+            ),
+            "dataloader_persistent_workers": bool(
+                getattr(cfg, "dataloader_num_workers", 0) > 0
+                and getattr(cfg, "persistent_workers", False)
+            ),
         }
 
         # Keeping num_train_epochs=1 is deliberate: max_steps is FTRAIN's
@@ -2524,6 +3119,23 @@ class Ftrain:
                 )
 
         trainer = None
+
+        if cfg.use_unsloth_trainer and UNSLOTH_AVAILABLE:
+            try:
+                # Unsloth switches between memory-efficient training/inference
+                # modes in several releases. This call is optional and guarded.
+                training_helper = getattr(
+                    FastLanguageModel,
+                    "for_training",
+                    None,
+                )
+                if callable(training_helper):
+                    training_helper(self.model)
+            except Exception:
+                logger.debug(
+                    "FTRAIN: Unsloth for_training preparation unavailable.",
+                    exc_info=True,
+                )
 
         if cfg.use_unsloth_trainer:
             try:
@@ -4067,8 +4679,31 @@ class Ftrain:
         self._train_started_at = time.time()
 
         self._start_intel()
+
+        # Detect the real machine before selecting a trainer. On the user's
+        # common Kaggle-style 2x-T4 notebook, this deliberately means:
+        #   * use Unsloth when installed;
+        #   * use FP16 (T4 has no native BF16 training path);
+        #   * keep one coherent GPU in a single notebook process;
+        #   * use DDP only when the job was actually launched distributed.
+        selected_backend = self._select_backend_for_hardware()
+
+        if self._ddp.is_main:
+            profile = self.hardware_info()
+            logger.info(
+                "FTRAIN hardware: backend=%s reason=%s device=%s GPUs=%s precision=%s",
+                selected_backend,
+                self._backend_reason,
+                profile.get("device"),
+                profile.get("gpu_count", 0),
+                profile.get("recommended_precision", "fp32"),
+            )
+
         self._apply_maximum_power()
         self._enforce_lr_guard()
+
+        # Never let a hidden multi-GPU dispatch sneak into training.
+        self._assert_training_device_coherence()
 
         self.model.train()
 
@@ -4080,7 +4715,7 @@ class Ftrain:
             f"Mode: "
             f"{'GRPO' if self.config.use_grpo else 'SFT'} | "
             f"Backend: "
-            f"{'HF/Unsloth' if self.config.use_hf_trainer else 'Custom'}"
+            f"{'GRPO' if self.config.use_grpo else ('Unsloth' if getattr(self.config, 'use_unsloth_trainer', False) and UNSLOTH_AVAILABLE else ('Transformers' if self.config.use_hf_trainer else 'Custom'))}"
         )
 
         eval_prompt, correct_answer = (
@@ -4121,6 +4756,20 @@ class Ftrain:
 
         if self._ddp.is_main:
             self._finalize_intel()
+
+        # Optional publication is deliberately opt-in and gated by the merger/CBA.
+        if _bool_config(
+            self.config,
+            "auto_publish_to_hub",
+            default=False,
+        ):
+            try:
+                self.publish_final_to_hub()
+            except Exception:
+                logger.warning(
+                    "FTRAIN: automatic publication hook failed; model remains local.",
+                    exc_info=True,
+                )
 
         if (
             self.captain is not None
@@ -4199,14 +4848,11 @@ class Ftrain:
                 exist_ok=True,
             )
 
-            self.model.save_pretrained(
-                str(path)
+            checkpoint_save_backend = self._save_model_artifact(
+                self.model,
+                path,
+                merged=False,
             )
-
-            if self.tokenizer is not None:
-                self.tokenizer.save_pretrained(
-                    str(path)
-                )
 
             if self.optimizer is not None:
                 torch.save(
@@ -4265,6 +4911,7 @@ class Ftrain:
                 "model_name": self.config.model_name,
                 "family": self.family,
                 "backend": self._backend,
+                "checkpoint_save_backend": checkpoint_save_backend,
                 "invalid_loss_count": self._invalid_loss_count,
                 "skipped_steps": self._skipped_steps,
                 "oom_count": self._oom_count,
@@ -4581,6 +5228,88 @@ class Ftrain:
     # Finalization
     # =========================================================================
 
+    def publication_status(self) -> Dict[str, Any]:
+        """Return the current publication gate state."""
+        allowed, reason, verdict = self._should_publish_model()
+        state = dict(self._publish_state)
+        state.update(
+            {
+                "requested": self._publish_requested(),
+                "approved_now": allowed,
+                "reason_now": reason,
+                "merger_verdict": verdict,
+            }
+        )
+        return state
+
+    def _save_model_artifact(
+        self,
+        model: torch.nn.Module,
+        destination: Path,
+        *,
+        merged: bool = False,
+    ) -> str:
+        """Save a model with Unsloth's merge-aware writer when possible."""
+        destination.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        # For the final artifact, prefer Unsloth's merged writer when a PEFT
+        # model is present. This avoids relying on Transformers conversion
+        # paths that may fail with quantized/adapter models.
+        if (
+            merged
+            and UNSLOTH_AVAILABLE
+            and FastLanguageModel is not None
+            and self.tokenizer is not None
+            and _bool_config(
+                self.config,
+                "merge_lora_on_save",
+                "save_merged_model",
+                default=True,
+            )
+        ):
+            saver = getattr(
+                FastLanguageModel,
+                "save_pretrained_merged",
+                None,
+            )
+
+            if callable(saver):
+                try:
+                    save_method = _string_config(
+                        self.config,
+                        "unsloth_save_method",
+                        default="merged_16bit",
+                    )
+
+                    saver(
+                        model,
+                        self.tokenizer,
+                        str(destination),
+                        save_method=save_method,
+                    )
+
+                    return "unsloth_" + save_method
+
+                except Exception:
+                    logger.warning(
+                        "FTRAIN: Unsloth merged save failed; falling back to model.save_pretrained().",
+                        exc_info=True,
+                    )
+
+        model.save_pretrained(
+            str(destination)
+        )
+
+        if self.tokenizer is not None:
+            self.tokenizer.save_pretrained(
+                str(destination)
+            )
+
+        return "transformers"
+
     def _finalize_model(
         self,
         model: torch.nn.Module,
@@ -4600,14 +5329,11 @@ class Ftrain:
             exist_ok=True,
         )
 
-        self.model.save_pretrained(
-            str(final_path)
+        save_backend = self._save_model_artifact(
+            self.model,
+            final_path,
+            merged=True,
         )
-
-        if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(
-                str(final_path)
-            )
 
         metadata = {
             "version": "ftrain-core-v1.1",
@@ -4622,6 +5348,10 @@ class Ftrain:
             "skipped_steps": self._skipped_steps,
             "invalid_loss_count": self._invalid_loss_count,
             "oom_count": self._oom_count,
+            "save_backend": save_backend,
+            "hardware": self.hardware_info(),
+            "backend_reason": self._backend_reason,
+            "publish_requested": self._publish_requested(),
         }
 
         with (
@@ -4644,6 +5374,23 @@ class Ftrain:
             final=True,
         )
 
+        allowed, publish_reason, publish_verdict = self._should_publish_model()
+        self._write_publish_decision(
+            approved=allowed,
+            reason=publish_reason,
+            verdict=publish_verdict,
+        )
+
+        if not allowed and self._publish_requested():
+            removed = _cleanup_publish_staging(
+                Path(self.config.output_dir).expanduser()
+            )
+            if removed:
+                logger.info(
+                    "FTRAIN: removed publication staging after a blocked publish: %s",
+                    removed,
+                )
+
         if self._ddp.is_main:
             ui.print_final_summary(
                 {
@@ -4652,6 +5399,16 @@ class Ftrain:
                     "Requested Steps": self.total_steps,
                     "Mode": mode,
                     "Backend": self._backend,
+                    "Backend Reason": self._backend_reason,
+                    "Save Backend": save_backend,
+                    "Publish": (
+                        "approved"
+                        if allowed
+                        else "blocked"
+                        if self._publish_requested()
+                        else "disabled"
+                    ),
+                    "Publish Reason": publish_reason,
                     "Dir": str(final_path),
                 }
             )
@@ -4785,6 +5542,8 @@ def _self_test() -> Dict[str, Any]:
         "remove_unused_columns": values[
             "remove_unused_columns"
         ],
+        "unsloth_available": bool(UNSLOTH_AVAILABLE),
+        "hardware_snapshot": _hardware_snapshot(),
     }
 
 
