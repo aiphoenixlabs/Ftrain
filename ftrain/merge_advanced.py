@@ -1,61 +1,66 @@
+
 """
 FTRAIN Merge Algorithms
 =======================
 
-High-performance and defensive merging utilities used by FTRAIN.
+Deep, defensive, memory-conscious model-merging utilities for FTRAIN.
 
-Supported functionality
------------------------
-• Diagonal Fisher information estimation
-• DARE merging
-• Task Arithmetic
-• TIES merging
-• Multi-model delta handling
-• Numerical safety / NaN protection
-• Device and dtype management
-• Shape validation
-• Deterministic seeded operations
-• CPU-offloaded Fisher storage
-• Architecture-aware compatibility hooks
-• Memory-conscious TIES implementation
-• Merge diagnostics
+Public API
+----------
+compute_fisher
+dare_merge
+task_arithmetic
+ties_merge_state_dict
+
+Additional API
+--------------
+MergeConfig
+MergeDiagnostics
+weighted_merge
+fisher_merge
+dare_merge_state_dict
+merge_state_dicts
+calculate_delta
+detect_tensor_health
+
+Design goals
+------------
+- Diagonal Fisher information estimation.
+- DARE merging.
+- Task Arithmetic.
+- TIES merging.
+- Multi-model delta handling.
+- Optional Fisher-weighted merging.
+- Numerical safety and NaN/Inf protection.
+- Device and dtype management.
+- Shape validation.
+- Deterministic seeded operations.
+- CPU-offloaded Fisher storage.
+- Memory-conscious TIES implementation.
+- Per-tensor diagnostics.
+- Delta clipping and candidate stabilization.
+- Architecture-aware compatibility hooks.
+- Preservation of integer/bool structural tensors.
+- Backward compatibility with the original public functions.
 
 Important
 ---------
-These functions intentionally do NOT blindly merge tensors with incompatible
-shapes.
+These algorithms operate on already-corresponding tensors/keys.
 
-Different model architectures can only be merged when a higher-level
-architecture mapper has established that two tensors represent compatible
-parameters. This module provides the mathematical operations; the architecture
-mapping layer should decide which tensors correspond to each other.
+Different model architectures must be aligned by a higher-level architecture
+mapping layer (for example FTRAIN CBA) before invoking tensor-level arithmetic.
 
-Example
--------
-    fisher = compute_fisher(
-        model,
-        loader,
-        device="cuda",
-        num_samples=100,
-    )
+CBA can decide:
+    - which tensors correspond,
+    - which source model should dominate,
+    - whether conflict is high,
+    - whether a tensor needs alignment,
+    - and which merge strategy should be selected.
 
-    result = dare_merge(
-        model_a_weight,
-        model_b_weight,
-        drop_rate=0.9,
-    )
+This module then performs the mathematical merge safely.
 
-    result = task_arithmetic(
-        model_a,
-        model_b,
-        base,
-    )
-
-    result = ties_merge_state_dict(
-        [model_a, model_b],
-        base,
-        density=0.2,
-    )
+No function here claims that a weight-space merge is behaviorally superior.
+Post-merge benchmark/evaluation remains necessary.
 """
 
 from __future__ import annotations
@@ -64,22 +69,42 @@ import logging
 import math
 import random
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-logger = logging.getLogger(__name__)
 
-__all__ = [
-    "compute_fisher",
-    "dare_merge",
-    "task_arithmetic",
-    "ties_merge_state_dict",
-]
+logger = logging.getLogger(__name__)
 
 
 TensorDict = Dict[str, torch.Tensor]
+
+
+__all__ = [
+    # Configuration / diagnostics
+    "MergeConfig",
+    "MergeDiagnostics",
+
+    # Fisher
+    "compute_fisher",
+
+    # Tensor operations
+    "dare_merge",
+    "task_arithmetic",
+    "weighted_merge",
+    "fisher_merge",
+
+    # State-dict operations
+    "ties_merge_state_dict",
+    "dare_merge_state_dict",
+    "merge_state_dicts",
+
+    # Utilities
+    "calculate_delta",
+    "detect_tensor_health",
+]
 
 
 # =============================================================================
@@ -89,11 +114,136 @@ TensorDict = Dict[str, torch.Tensor]
 _EPS = 1e-8
 _DEFAULT_NUM_SAMPLES = 50
 
+_DEFAULT_EXPLOSION_RATIO = 5.0
+_DEFAULT_DELTA_NORM_RATIO = 2.5
+_DEFAULT_DARE_DROP_RATE = 0.9
+_DEFAULT_TIES_DENSITY = 0.2
+
+_CONFLICT_ACTIONS = {
+    "ties",
+    "dare",
+}
+
+_SENSITIVE_NAME_HINTS = (
+    "embed_tokens",
+    "tok_embeddings",
+    "word_embeddings",
+    "lm_head",
+    "output_projection",
+    "layernorm",
+    "layer_norm",
+)
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass(frozen=True)
+class MergeConfig:
+    """
+    Centralized configuration for safe merge operations.
+
+    The existing public functions do not require this class, but FTRAIN can
+    construct one and feed its values into the individual algorithms.
+    """
+
+    strict_shapes: bool = True
+    preserve_unmatched: bool = True
+
+    max_delta_norm_ratio: float = _DEFAULT_DELTA_NORM_RATIO
+    output_explosion_ratio: float = _DEFAULT_EXPLOSION_RATIO
+
+    ties_density: float = _DEFAULT_TIES_DENSITY
+    dare_drop_rate: float = _DEFAULT_DARE_DROP_RATE
+
+    sanitize_nonfinite: bool = True
+
+    protect_sensitive_tensors: bool = True
+    sensitive_mix_floor: float = 0.15
+
+    def validate(self) -> None:
+        if self.max_delta_norm_ratio <= 0:
+            raise ValueError(
+                "max_delta_norm_ratio must be > 0."
+            )
+
+        if self.output_explosion_ratio <= 0:
+            raise ValueError(
+                "output_explosion_ratio must be > 0."
+            )
+
+        if not 0 <= self.ties_density <= 1:
+            raise ValueError(
+                "ties_density must be in [0, 1]."
+            )
+
+        if not 0 <= self.dare_drop_rate <= 1:
+            raise ValueError(
+                "dare_drop_rate must be in [0, 1]."
+            )
+
+        if not 0 <= self.sensitive_mix_floor <= 1:
+            raise ValueError(
+                "sensitive_mix_floor must be in [0, 1]."
+            )
+
+
+@dataclass
+class MergeDiagnostics:
+    """
+    Captain-friendly diagnostics for a state-dict merge.
+    """
+
+    operation: str
+
+    total_keys: int = 0
+    merged_keys: int = 0
+    preserved_keys: int = 0
+    skipped_keys: int = 0
+    shape_mismatch_keys: int = 0
+    nonfloating_keys: int = 0
+    repaired_keys: int = 0
+
+    max_output_ratio: float = 1.0
+    min_output_ratio: float = 1.0
+    mean_output_ratio: float = 1.0
+
+    max_delta_ratio: float = 0.0
+    nonfinite_outputs: int = 0
+
+    warnings: List[str] = field(default_factory=list)
+    per_key: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict
+    )
+
+    def add_warning(self, message: str) -> None:
+        if message not in self.warnings:
+            self.warnings.append(message)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "operation": self.operation,
+            "total_keys": self.total_keys,
+            "merged_keys": self.merged_keys,
+            "preserved_keys": self.preserved_keys,
+            "skipped_keys": self.skipped_keys,
+            "shape_mismatch_keys": self.shape_mismatch_keys,
+            "nonfloating_keys": self.nonfloating_keys,
+            "repaired_keys": self.repaired_keys,
+            "max_output_ratio": self.max_output_ratio,
+            "min_output_ratio": self.min_output_ratio,
+            "mean_output_ratio": self.mean_output_ratio,
+            "max_delta_ratio": self.max_delta_ratio,
+            "nonfinite_outputs": self.nonfinite_outputs,
+            "warnings": list(self.warnings),
+            "per_key": dict(self.per_key),
+        }
+
 
 # =============================================================================
 # General helpers
 # =============================================================================
-
 
 def _is_tensor(value: Any) -> bool:
     return isinstance(value, torch.Tensor)
@@ -101,11 +251,10 @@ def _is_tensor(value: Any) -> bool:
 
 def _is_mergeable_tensor(tensor: torch.Tensor) -> bool:
     """
-    Return whether a tensor is mathematically suitable for floating-point
-    merge arithmetic.
+    Floating-point and complex tensors support merge arithmetic.
 
-    Integer/bool tensors such as token IDs or certain bookkeeping tensors
-    should never be merged with arithmetic operations.
+    Integer/bool tensors are treated as structural metadata and are preserved
+    from the target/base model rather than arithmetically interpolated.
     """
     return (
         isinstance(tensor, torch.Tensor)
@@ -146,12 +295,24 @@ def _validate_positive(
             f"{name} must be a number, got {value!r}."
         ) from exc
 
-    if value <= 0.0:
+    if value <= 0:
         raise ValueError(
             f"{name} must be greater than zero, got {value}."
         )
 
     return value
+
+
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+
+    return result if math.isfinite(result) else default
 
 
 def _same_shape(
@@ -181,66 +342,182 @@ def _require_floating(
 ) -> None:
     if not _is_mergeable_tensor(tensor):
         raise TypeError(
-            f"{name} must be a floating-point or complex tensor; "
+            f"{name} must be floating-point or complex; "
             f"got dtype={tensor.dtype}, shape={tuple(tensor.shape)}."
         )
 
 
-def _safe_float(
-    value: Any,
-    default: float = 0.0,
+def _safe_norm(
+    tensor: torch.Tensor,
 ) -> float:
+    if tensor.numel() == 0:
+        return 0.0
+
     try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return default
+        return float(
+            tensor.detach()
+            .float()
+            .norm()
+            .item()
+        )
+    except (RuntimeError, ValueError):
+        return float("inf")
 
-    return result if math.isfinite(result) else default
+
+def _finite_or_zero(
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    if not _is_mergeable_tensor(tensor):
+        return tensor
+
+    return torch.nan_to_num(
+        tensor,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
 
 
-def _safe_loss(
-    loss: torch.Tensor,
+def _copy_preserving_meta(
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    return tensor.detach().clone()
+
+
+def _is_sensitive_key(
+    key: str,
 ) -> bool:
-    if not isinstance(loss, torch.Tensor):
-        return False
+    lowered = str(key).lower()
+    return any(
+        hint in lowered
+        for hint in _SENSITIVE_NAME_HINTS
+    )
 
-    if loss.numel() != 1:
-        return False
 
-    return bool(torch.isfinite(loss.detach()).item())
+def _compatible_baseline(
+    tensor: torch.Tensor,
+    baseline: Optional[torch.Tensor],
+) -> bool:
+    return (
+        baseline is not None
+        and isinstance(baseline, torch.Tensor)
+        and _same_shape(tensor, baseline)
+        and _is_mergeable_tensor(tensor)
+        and _is_mergeable_tensor(baseline)
+    )
 
+
+def _repair_output(
+    tensor: torch.Tensor,
+    *,
+    clamp_abs: Optional[float] = None,
+) -> torch.Tensor:
+    if not _is_mergeable_tensor(tensor):
+        return tensor
+
+    result = torch.nan_to_num(
+        tensor,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    if clamp_abs is not None:
+        result = result.clamp(
+            min=-float(clamp_abs),
+            max=float(clamp_abs),
+        )
+
+    return result
+
+
+def _normalize_weights(
+    weights: Sequence[float],
+) -> List[float]:
+    values = []
+
+    for weight in weights:
+        weight = _safe_float(
+            weight,
+            default=0.0,
+        )
+
+        if weight < 0:
+            raise ValueError(
+                "Merge weights cannot be negative."
+            )
+
+        values.append(weight)
+
+    total = sum(values)
+
+    if total <= _EPS:
+        return [
+            1.0 / max(1, len(values))
+            for _ in values
+        ]
+
+    return [
+        value / total
+        for value in values
+    ]
+
+
+def _effective_sensitive_alpha(
+    alpha: float,
+    *,
+    sensitive: bool,
+    floor: float,
+) -> float:
+    """
+    Keep a sensitive parameter from being completely overwritten.
+
+    alpha represents the contribution of the incoming/source tensor.
+    """
+    alpha = max(0.0, min(1.0, float(alpha)))
+
+    if not sensitive:
+        return alpha
+
+    return min(
+        alpha,
+        1.0 - float(floor),
+    )
+
+
+# =============================================================================
+# Device and autocast helpers
+# =============================================================================
 
 def _resolve_device(
     device: Union[str, torch.device],
 ) -> torch.device:
-    """
-    Resolve and validate a requested device.
-
-    Unlike the old implementation, this doesn't assume CUDA exists merely
-    because the caller supplied a CUDA-looking string.
-    """
     resolved = torch.device(device)
 
-    if resolved.type == "cuda" and not torch.cuda.is_available():
+    if (
+        resolved.type == "cuda"
+        and not torch.cuda.is_available()
+    ):
         raise RuntimeError(
-            "CUDA was requested for Fisher computation, but CUDA is not "
-            "available."
+            "CUDA was requested, but CUDA is not available."
         )
 
     if resolved.type == "mps":
-        if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
+        if (
+            not hasattr(torch.backends, "mps")
+            or
+            not torch.backends.mps.is_available()
+        ):
             raise RuntimeError(
-                "MPS was requested for Fisher computation, but MPS is not "
-                "available."
+                "MPS was requested, but MPS is not available."
             )
 
     return resolved
 
 
-def _supports_amp(device: torch.device) -> bool:
-    """
-    Determine whether autocast is useful/supported on the selected device.
-    """
+def _supports_amp(
+    device: torch.device,
+) -> bool:
     if device.type == "cuda":
         return torch.cuda.is_available()
 
@@ -266,7 +543,6 @@ def _choose_amp_dtype(
         return torch.float16
 
     if device.type == "cpu":
-        # BF16 is generally the safest CPU autocast choice when available.
         return torch.bfloat16
 
     if device.type == "mps":
@@ -279,13 +555,6 @@ def _autocast_context(
     device: torch.device,
     enabled: bool,
 ):
-    """
-    Return a device-correct autocast context.
-
-    ``torch.amp.autocast`` has different practical support characteristics
-    across PyTorch versions/devices, so failures should gracefully fall back
-    to a disabled context.
-    """
     if not enabled or not _supports_amp(device):
         return torch.autocast(
             device_type="cpu",
@@ -318,33 +587,36 @@ def _move_batch_to_device(
     batch: Any,
     device: torch.device,
 ) -> Any:
-    """
-    Recursively move tensor-containing batches to a device.
-
-    Supports the common Hugging Face dictionary format as well as nested
-    dictionaries/lists/tuples.
-    """
     if isinstance(batch, torch.Tensor):
         return batch.to(
             device,
-            non_blocking=device.type == "cuda",
+            non_blocking=(device.type == "cuda"),
         )
 
     if isinstance(batch, Mapping):
         return {
-            key: _move_batch_to_device(value, device)
+            key: _move_batch_to_device(
+                value,
+                device,
+            )
             for key, value in batch.items()
         }
 
     if isinstance(batch, tuple):
         return tuple(
-            _move_batch_to_device(value, device)
+            _move_batch_to_device(
+                value,
+                device,
+            )
             for value in batch
         )
 
     if isinstance(batch, list):
         return [
-            _move_batch_to_device(value, device)
+            _move_batch_to_device(
+                value,
+                device,
+            )
             for value in batch
         ]
 
@@ -354,9 +626,6 @@ def _move_batch_to_device(
 def _extract_loss(
     outputs: Any,
 ) -> Optional[torch.Tensor]:
-    """
-    Extract a scalar loss from Hugging Face-style model outputs.
-    """
     if hasattr(outputs, "loss"):
         loss = outputs.loss
     elif isinstance(outputs, Mapping):
@@ -365,9 +634,6 @@ def _extract_loss(
         loss = outputs[0]
     else:
         loss = None
-
-    if loss is None:
-        return None
 
     if not isinstance(loss, torch.Tensor):
         return None
@@ -381,9 +647,6 @@ def _extract_loss(
 def _batch_size_from_batch(
     batch: Any,
 ) -> int:
-    """
-    Infer batch size from common HF batches.
-    """
     if isinstance(batch, Mapping):
         for key in (
             "input_ids",
@@ -391,41 +654,148 @@ def _batch_size_from_batch(
             "attention_mask",
         ):
             value = batch.get(key)
-            if isinstance(value, torch.Tensor) and value.ndim >= 1:
-                return int(value.shape[0])
+
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim >= 1
+            ):
+                return max(1, int(value.shape[0]))
 
         for value in batch.values():
-            if isinstance(value, torch.Tensor) and value.ndim >= 1:
-                return int(value.shape[0])
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim >= 1
+            ):
+                return max(1, int(value.shape[0]))
 
-    if isinstance(batch, torch.Tensor) and batch.ndim >= 1:
-        return int(batch.shape[0])
+    if (
+        isinstance(batch, torch.Tensor)
+        and batch.ndim >= 1
+    ):
+        return max(1, int(batch.shape[0]))
 
     return 1
 
 
-def _safe_grad_square(
-    grad: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Compute squared gradients in FP32 with finite-value sanitization.
-    """
-    result = grad.detach().float()
+# =============================================================================
+# Tensor health / diagnostics
+# =============================================================================
 
-    # Avoid NaN/Inf contamination of the Fisher matrix.
-    result = torch.nan_to_num(
-        result,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
+def detect_tensor_health(
+    tensor: torch.Tensor,
+    *,
+    baseline: Optional[torch.Tensor] = None,
+) -> Dict[str, Any]:
+    """
+    Return numerical-health diagnostics without mutating the tensor.
+    """
+    if not isinstance(
+        tensor,
+        torch.Tensor,
+    ):
+        raise TypeError(
+            "tensor must be a torch.Tensor."
+        )
+
+    total = int(tensor.numel())
+
+    if (
+        total == 0
+        or
+        not _is_mergeable_tensor(tensor)
+    ):
+        return {
+            "finite": True,
+            "finite_ratio": 1.0,
+            "norm": 0.0,
+            "baseline_norm": 0.0,
+            "norm_ratio": 1.0,
+            "max_abs": 0.0,
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+        }
+
+    finite_count = int(
+        torch.isfinite(tensor).sum().item()
     )
 
-    return result.square()
+    finite_ratio = (
+        finite_count / total
+    )
+
+    value = tensor.detach().float()
+
+    result = {
+        "finite": finite_ratio == 1.0,
+        "finite_ratio": finite_ratio,
+        "norm": _safe_norm(tensor),
+        "baseline_norm": 0.0,
+        "norm_ratio": 1.0,
+        "max_abs": _safe_float(
+            value.abs().max()
+        ),
+        "mean": _safe_float(
+            value.mean()
+        ),
+        "std": _safe_float(
+            value.std(
+                unbiased=False
+            )
+        ) if total > 1 else 0.0,
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+    }
+
+    if (
+        baseline is not None
+        and
+        _compatible_baseline(
+            tensor,
+            baseline,
+        )
+    ):
+        base_norm = _safe_norm(
+            baseline
+        )
+
+        result["baseline_norm"] = base_norm
+
+        if (
+            base_norm > _EPS
+            and
+            math.isfinite(base_norm)
+        ):
+            result["norm_ratio"] = (
+                result["norm"]
+                /
+                max(
+                    base_norm,
+                    _EPS,
+                )
+            )
+
+    return result
 
 
 # =============================================================================
 # Fisher Information
 # =============================================================================
+
+def _safe_grad_square(
+    grad: torch.Tensor,
+) -> torch.Tensor:
+    value = grad.detach().float()
+
+    value = torch.nan_to_num(
+        value,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    return value.square()
 
 
 def compute_fisher(
@@ -439,56 +809,28 @@ def compute_fisher(
     offload_to_cpu: bool = True,
     max_grad_norm: Optional[float] = None,
     clear_cache_every: int = 0,
+    loss_reduction: str = "mean",
 ) -> Optional[Dict[str, torch.Tensor]]:
     """
     Compute a diagonal Fisher information approximation.
 
-    Parameters
-    ----------
-    model:
-        Model used for calibration.
+    The returned tensor for each parameter is the estimated mean squared
+    gradient.
 
-    loader:
-        Iterable yielding batches compatible with ``model(**batch)``.
-
-    device:
-        Device used for the forward/backward computation.
-
-    num_samples:
-        Maximum number of examples to process.
-
-    use_amp:
-        Use automatic mixed precision when supported.
-
-    trainable_only:
-        If True, only parameters with ``requires_grad=True`` are included.
-
-        If False, all floating-point parameters are considered. This is
-        usually more appropriate for model-merging Fisher estimation.
-
-    offload_to_cpu:
-        Store Fisher diagonals on CPU to avoid consuming GPU memory.
-
-    max_grad_norm:
-        Optional gradient clipping before squaring gradients.
-
-    clear_cache_every:
-        If > 0, optionally call ``torch.cuda.empty_cache()`` after this many
-        processed batches. Usually unnecessary; useful for very large models.
-
-    Returns
-    -------
-    Optional[Dict[str, torch.Tensor]]
-        Per-parameter diagonal Fisher estimates, or None if computation fails.
+    Fisher storage is FP32 and may be CPU-offloaded to avoid consuming GPU
+    memory needed by the model itself.
     """
-    if not isinstance(model, nn.Module):
+    if not isinstance(
+        model,
+        nn.Module,
+    ):
         raise TypeError(
-            f"model must be torch.nn.Module, got {type(model).__name__}."
+            "model must be a torch.nn.Module."
         )
 
     if num_samples <= 0:
         raise ValueError(
-            f"num_samples must be > 0, got {num_samples}."
+            "num_samples must be > 0."
         )
 
     if max_grad_norm is not None:
@@ -497,13 +839,23 @@ def compute_fisher(
             "max_grad_norm",
         )
 
-    resolved_device = _resolve_device(device)
+    loss_reduction = str(
+        loss_reduction
+    ).lower()
+
+    if loss_reduction not in {
+        "mean",
+        "sum",
+    }:
+        raise ValueError(
+            "loss_reduction must be 'mean' or 'sum'."
+        )
+
+    resolved_device = _resolve_device(
+        device
+    )
 
     was_training = model.training
-
-    # -------------------------------------------------------------------------
-    # Build Fisher storage.
-    # -------------------------------------------------------------------------
 
     fisher: Dict[str, torch.Tensor] = {}
 
@@ -511,7 +863,11 @@ def compute_fisher(
         if not param.is_floating_point():
             continue
 
-        if trainable_only and not param.requires_grad:
+        if (
+            trainable_only
+            and
+            not param.requires_grad
+        ):
             continue
 
         storage_device = (
@@ -528,42 +884,49 @@ def compute_fisher(
 
     if not fisher:
         logger.warning(
-            "Fisher computation skipped: no floating-point parameters "
-            "were selected."
+            "No floating-point parameters selected for Fisher."
         )
         return None
 
-    # -------------------------------------------------------------------------
-    # Save model state.
-    # -------------------------------------------------------------------------
+    samples_processed = 0
+    batches_processed = 0
+    invalid_batches = 0
 
     try:
         model.eval()
 
-        samples_processed = 0
-        batches_processed = 0
-        invalid_batches = 0
-
         amp_enabled = bool(
             use_amp
-            and _supports_amp(resolved_device)
+            and
+            _supports_amp(
+                resolved_device
+            )
         )
 
         for batch in loader:
             if samples_processed >= num_samples:
                 break
 
-            batch_size = max(
-                1,
-                _batch_size_from_batch(batch),
+            batch_size = _batch_size_from_batch(
+                batch
             )
 
-            # Don't process more samples than requested.
-            remaining = num_samples - samples_processed
+            remaining = (
+                num_samples
+                -
+                samples_processed
+            )
 
-            batch_device = _move_batch_to_device(
-                batch,
-                resolved_device,
+            effective_batch_size = min(
+                batch_size,
+                remaining,
+            )
+
+            batch_device = (
+                _move_batch_to_device(
+                    batch,
+                    resolved_device,
+                )
             )
 
             model.zero_grad(
@@ -585,28 +948,16 @@ def compute_fisher(
 
                 if loss is None:
                     invalid_batches += 1
-                    logger.debug(
-                        "Fisher skipped batch: model did not return a scalar "
-                        "loss."
-                    )
                     continue
 
-                if not _safe_loss(loss):
+                if not bool(
+                    torch.isfinite(
+                        loss.detach()
+                    ).item()
+                ):
                     invalid_batches += 1
-                    logger.debug(
-                        "Fisher skipped non-finite loss."
-                    )
                     continue
 
-                # If a batch contains more examples than requested, scale the
-                # contribution so the final average still represents the
-                # requested number of examples reasonably.
-                effective_batch_size = min(
-                    batch_size,
-                    remaining,
-                )
-
-                # Backpropagate the normal batch loss.
                 loss.backward()
 
                 if max_grad_norm is not None:
@@ -615,12 +966,10 @@ def compute_fisher(
                         max_norm=max_grad_norm,
                     )
 
-                # -------------------------------------------------------------
-                # Accumulate diagonal Fisher.
-                # -------------------------------------------------------------
-
                 with torch.no_grad():
-                    for name, param in model.named_parameters():
+                    for name, param in (
+                        model.named_parameters()
+                    ):
                         if name not in fisher:
                             continue
 
@@ -638,24 +987,23 @@ def compute_fisher(
 
                         fisher[name].add_(
                             grad_sq,
-                            alpha=float(effective_batch_size),
+                            alpha=float(
+                                effective_batch_size
+                            ),
                         )
 
-                samples_processed += effective_batch_size
+                samples_processed += (
+                    effective_batch_size
+                )
+
                 batches_processed += 1
 
             except RuntimeError as exc:
-                # A single problematic calibration batch should not necessarily
-                # destroy an entire merge operation.
                 invalid_batches += 1
 
                 logger.warning(
-                    "Fisher skipped a batch because of runtime error: %s",
+                    "Skipping Fisher batch due to runtime error: %s",
                     exc,
-                )
-
-                model.zero_grad(
-                    set_to_none=True
                 )
 
             finally:
@@ -665,9 +1013,15 @@ def compute_fisher(
 
             if (
                 clear_cache_every > 0
-                and batches_processed > 0
-                and batches_processed % clear_cache_every == 0
-                and resolved_device.type == "cuda"
+                and
+                batches_processed > 0
+                and
+                batches_processed
+                %
+                clear_cache_every
+                == 0
+                and
+                resolved_device.type == "cuda"
             ):
                 try:
                     torch.cuda.empty_cache()
@@ -676,16 +1030,15 @@ def compute_fisher(
 
         if samples_processed <= 0:
             logger.error(
-                "Fisher computation processed zero valid samples."
+                "Fisher processed zero valid samples."
             )
             return None
 
-        # ---------------------------------------------------------------------
-        # Normalize Fisher estimates.
-        # ---------------------------------------------------------------------
-
         denominator = float(
-            max(1, samples_processed)
+            max(
+                1,
+                samples_processed,
+            )
         )
 
         with torch.no_grad():
@@ -701,9 +1054,8 @@ def compute_fisher(
                 )
 
         logger.info(
-            "Fisher computation completed: "
-            "%d samples, %d batches, %d invalid batches, "
-            "%d parameter tensors.",
+            "Fisher complete: %d samples, %d batches, "
+            "%d invalid batches, %d tensors.",
             samples_processed,
             batches_processed,
             invalid_batches,
@@ -729,9 +1081,8 @@ def compute_fisher(
 
 
 # =============================================================================
-# DARE
+# DARE tensor merge
 # =============================================================================
-
 
 def dare_merge(
     da: torch.Tensor,
@@ -741,33 +1092,19 @@ def dare_merge(
     seed: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    DARE-style delta merge.
+    DARE-style merge between two tensors.
 
-    ``da`` is treated as the base tensor and ``db`` as the target tensor.
+    ``da`` is treated as the base tensor and ``db`` as the incoming tensor.
 
-    The operation is:
-
+    For 0 < drop_rate < 1:
         delta = db - da
+        retained_delta = random_mask(delta)
+        result = da + retained_delta
 
-        mask ~ Bernoulli(1 - drop_rate)
+    When rescale=True, the retained delta is divided by the keep probability
+    so its expected magnitude is approximately preserved.
 
-        result = da + mask * delta
-
-    When ``rescale=True`` retained deltas are divided by the keep probability,
-    preserving their expected magnitude.
-
-    Edge cases
-    ----------
-    drop_rate == 0:
-        Returns ``db`` exactly.
-
-    drop_rate == 1:
-        Returns ``da`` exactly.
-
-    Notes
-    -----
-    DARE requires equal-shaped tensors. Cross-architecture parameter mapping
-    must happen before this function.
+    The random generator is local and deterministic when ``seed`` is supplied.
     """
     _require_floating(
         da,
@@ -790,12 +1127,14 @@ def dare_merge(
     )
 
     if drop_rate == 0.0:
-        return db.clone()
+        return db.detach().clone()
 
     if drop_rate == 1.0:
-        return da.clone()
+        return da.detach().clone()
 
     keep_probability = 1.0 - drop_rate
+
+    generator = None
 
     if seed is not None:
         generator = torch.Generator(
@@ -804,17 +1143,17 @@ def dare_merge(
         generator.manual_seed(
             int(seed)
         )
-    else:
-        generator = None
 
     with torch.no_grad():
         base = da.float()
         target = db.float()
 
-        delta = target - base
+        delta = (
+            target
+            -
+            base
+        )
 
-        # Generate a compact byte mask rather than a float tensor. This can
-        # substantially reduce temporary memory for large model weights.
         random_values = torch.rand(
             delta.shape,
             device=delta.device,
@@ -832,23 +1171,177 @@ def dare_merge(
                 keep_probability
             )
 
-        result = base + delta * mask
+        result = (
+            base
+            +
+            delta * mask
+        )
 
-        result = torch.nan_to_num(
-            result,
+        result = _repair_output(
+            result
+        )
+
+        return result.to(
+            device=da.device,
+            dtype=da.dtype,
+        )
+
+
+# =============================================================================
+# DARE state-dict merge
+# =============================================================================
+
+def dare_merge_state_dict(
+    model_a: Mapping[str, torch.Tensor],
+    model_b: Mapping[str, torch.Tensor],
+    *,
+    drop_rate: float = 0.9,
+    rescale: bool = True,
+    seed: Optional[int] = None,
+    strict_shapes: bool = True,
+    preserve_unmatched: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """
+    Apply DARE independently to every corresponding state-dict tensor.
+    """
+    drop_rate = _validate_probability(
+        drop_rate,
+        "drop_rate",
+    )
+
+    output: Dict[str, torch.Tensor] = {}
+
+    names = list(model_a.keys())
+
+    if preserve_unmatched:
+        names.extend(
+            key
+            for key in model_b.keys()
+            if key not in model_a
+        )
+
+    # Deterministic name order.
+    names = sorted(
+        set(names)
+    )
+
+    for index, name in enumerate(names):
+        a = model_a.get(name)
+        b = model_b.get(name)
+
+        if a is None:
+            if preserve_unmatched and b is not None:
+                output[name] = b.detach().clone()
+            continue
+
+        if b is None:
+            if preserve_unmatched:
+                output[name] = a.detach().clone()
+            continue
+
+        if (
+            not _is_mergeable_tensor(a)
+            or
+            not _is_mergeable_tensor(b)
+        ):
+            output[name] = a.detach().clone()
+            continue
+
+        if not _same_shape(a, b):
+            if strict_shapes:
+                raise ValueError(
+                    f"DARE state merge: shape mismatch for {name!r}: "
+                    f"{tuple(a.shape)} vs {tuple(b.shape)}."
+                )
+
+            output[name] = a.detach().clone()
+            continue
+
+        tensor_seed = (
+            None
+            if seed is None
+            else int(seed) + index
+        )
+
+        output[name] = dare_merge(
+            a,
+            b,
+            drop_rate=drop_rate,
+            rescale=rescale,
+            seed=tensor_seed,
+        )
+
+    return output
+
+
+# =============================================================================
+# Task Arithmetic helpers
+# =============================================================================
+
+def calculate_delta(
+    model: Mapping[str, torch.Tensor],
+    base: Mapping[str, torch.Tensor],
+    *,
+    strict_shapes: bool = True,
+    preserve_unmatched_base: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """
+    Compute ``model - base`` for all compatible floating tensors.
+
+    Integer/bool tensors are excluded because task arithmetic is intended for
+    learned parameter deltas.
+    """
+    result: Dict[str, torch.Tensor] = {}
+
+    for name, base_tensor in base.items():
+        if not torch.is_tensor(base_tensor):
+            continue
+
+        tensor = model.get(name)
+
+        if tensor is None:
+            if preserve_unmatched_base:
+                result[name] = torch.zeros_like(
+                    base_tensor
+                )
+            continue
+
+        if not _is_mergeable_tensor(
+            base_tensor
+        ):
+            continue
+
+        _require_floating(
+            tensor,
+            name=f"model[{name!r}]",
+        )
+
+        if not _same_shape(
+            tensor,
+            base_tensor,
+        ):
+            if strict_shapes:
+                raise ValueError(
+                    f"calculate_delta: shape mismatch for {name!r}: "
+                    f"{tuple(tensor.shape)} vs "
+                    f"{tuple(base_tensor.shape)}."
+                )
+            continue
+
+        delta = (
+            tensor.float()
+            -
+            base_tensor.float()
+        )
+
+        result[name] = torch.nan_to_num(
+            delta,
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
         )
 
-        return result.to(
-            dtype=da.dtype
-        )
-
-
-# =============================================================================
-# Task Arithmetic
-# =============================================================================
+    return result
 
 
 def _clip_delta_norm(
@@ -856,44 +1349,60 @@ def _clip_delta_norm(
     base: torch.Tensor,
     max_norm_ratio: float,
 ) -> torch.Tensor:
-    """
-    Limit delta magnitude relative to the base tensor.
-
-    This is more stable than clipping the final candidate norm because it
-    directly controls how much the merge can move away from the base.
-    """
-    if max_norm_ratio <= 0.0:
-        return torch.zeros_like(delta)
-
-    base_norm = torch.linalg.vector_norm(
-        base.float()
+    max_norm_ratio = _validate_positive(
+        max_norm_ratio,
+        "max_norm_ratio",
     )
 
-    delta_norm = torch.linalg.vector_norm(
-        delta.float()
+    base_norm = _safe_norm(
+        base
     )
 
-    if not torch.isfinite(base_norm):
-        return torch.zeros_like(delta)
+    delta_norm = _safe_norm(
+        delta
+    )
 
-    if not torch.isfinite(delta_norm):
-        return torch.zeros_like(delta)
+    if (
+        not math.isfinite(base_norm)
+        or
+        not math.isfinite(delta_norm)
+    ):
+        return torch.zeros_like(
+            delta
+        )
 
     if delta_norm <= _EPS:
         return delta
 
-    allowed = base_norm * max_norm_ratio
+    if base_norm <= _EPS:
+        return delta
 
-    if allowed <= _EPS:
-        return torch.zeros_like(delta)
+    allowed = (
+        base_norm
+        *
+        max_norm_ratio
+    )
 
-    if delta_norm > allowed:
-        delta = delta * (
-            allowed / delta_norm
+    if delta_norm <= allowed:
+        return delta
+
+    return (
+        delta
+        *
+        (
+            allowed
+            /
+            max(
+                delta_norm,
+                _EPS,
+            )
         )
+    )
 
-    return delta
 
+# =============================================================================
+# Task Arithmetic
+# =============================================================================
 
 def task_arithmetic(
     ma: Mapping[str, torch.Tensor],
@@ -906,27 +1415,20 @@ def task_arithmetic(
     preserve_unmatched_base: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
-    Merge model deltas using Task Arithmetic.
-
-    For compatible parameters:
+    Merge two task deltas against a base model.
 
         delta_a = A - Base
         delta_b = B - Base
 
-        merged = Base + scaling * (delta_a + delta_b)
+        result = Base + scaling * (delta_a + delta_b)
 
-    Parameters absent from both models are preserved from ``base`` when
-    ``preserve_unmatched_base=True``.
-
-    ``strict_shapes=True`` protects against accidentally combining unrelated
-    tensors with the same parameter name but incompatible dimensions.
+    ``max_norm_ratio`` limits the combined delta relative to the base tensor,
+    reducing the chance of catastrophic movement.
     """
-    try:
-        scaling = float(scaling)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            f"scaling must be numeric, got {scaling!r}."
-        ) from exc
+    scaling = _safe_float(
+        scaling,
+        default=float("nan"),
+    )
 
     if not math.isfinite(scaling):
         raise ValueError(
@@ -940,127 +1442,444 @@ def task_arithmetic(
 
     merged: Dict[str, torch.Tensor] = {}
 
-    with torch.no_grad():
-        for name, base_tensor in base.items():
-            if not isinstance(base_tensor, torch.Tensor):
-                continue
+    for name, base_tensor in base.items():
+        if not torch.is_tensor(base_tensor):
+            continue
 
-            # Non-floating tensors should generally be copied from the base
-            # rather than mathematically merged.
-            if not _is_mergeable_tensor(base_tensor):
-                merged[name] = base_tensor.clone()
-                continue
+        tensor_a = ma.get(name)
+        tensor_b = mb.get(name)
 
-            tensor_a = ma.get(name)
-            tensor_b = mb.get(name)
-
-            if tensor_a is None and tensor_b is None:
-                if preserve_unmatched_base:
-                    merged[name] = base_tensor.clone()
-
-                continue
-
-            if tensor_a is not None:
-                _require_floating(
-                    tensor_a,
-                    name=f"ma[{name!r}]",
+        if (
+            tensor_a is None
+            and
+            tensor_b is None
+        ):
+            if preserve_unmatched_base:
+                merged[name] = (
+                    base_tensor.detach().clone()
                 )
+            continue
 
-                if strict_shapes:
-                    _require_same_shape(
-                        tensor_a,
-                        base_tensor,
-                        operation=f"Task Arithmetic ({name})",
-                    )
-                elif not _same_shape(
+        if not _is_mergeable_tensor(
+            base_tensor
+        ):
+            merged[name] = (
+                base_tensor.detach().clone()
+            )
+            continue
+
+        if tensor_a is not None:
+            _require_floating(
+                tensor_a,
+                name=f"ma[{name!r}]",
+            )
+
+            if strict_shapes:
+                _require_same_shape(
                     tensor_a,
                     base_tensor,
-                ):
-                    tensor_a = None
-
-            if tensor_b is not None:
-                _require_floating(
-                    tensor_b,
-                    name=f"mb[{name!r}]",
+                    operation=f"Task Arithmetic ({name})",
                 )
+            elif not _same_shape(
+                tensor_a,
+                base_tensor,
+            ):
+                tensor_a = None
 
-                if strict_shapes:
-                    _require_same_shape(
-                        tensor_b,
-                        base_tensor,
-                        operation=f"Task Arithmetic ({name})",
-                    )
-                elif not _same_shape(
+        if tensor_b is not None:
+            _require_floating(
+                tensor_b,
+                name=f"mb[{name!r}]",
+            )
+
+            if strict_shapes:
+                _require_same_shape(
                     tensor_b,
                     base_tensor,
-                ):
-                    tensor_b = None
-
-            base_fp32 = base_tensor.float()
-
-            delta_a = (
-                tensor_a.float() - base_fp32
-                if tensor_a is not None
-                else torch.zeros_like(base_fp32)
-            )
-
-            delta_b = (
-                tensor_b.float() - base_fp32
-                if tensor_b is not None
-                else torch.zeros_like(base_fp32)
-            )
-
-            combined_delta = (
-                scaling * (
-                    delta_a + delta_b
+                    operation=f"Task Arithmetic ({name})",
                 )
-            )
+            elif not _same_shape(
+                tensor_b,
+                base_tensor,
+            ):
+                tensor_b = None
 
-            combined_delta = torch.nan_to_num(
-                combined_delta,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
+        base_fp32 = (
+            base_tensor
+            .detach()
+            .float()
+        )
 
-            combined_delta = _clip_delta_norm(
-                combined_delta,
-                base_fp32,
-                max_norm_ratio,
+        delta_a = (
+            tensor_a.detach().float()
+            -
+            base_fp32
+            if tensor_a is not None
+            else torch.zeros_like(
+                base_fp32
             )
+        )
 
-            candidate = (
-                base_fp32 + combined_delta
+        delta_b = (
+            tensor_b.detach().float()
+            -
+            base_fp32
+            if tensor_b is not None
+            else torch.zeros_like(
+                base_fp32
             )
+        )
 
-            candidate = torch.nan_to_num(
-                candidate,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
+        combined = (
+            float(scaling)
+            *
+            (
+                delta_a
+                +
+                delta_b
             )
+        )
 
-            merged[name] = candidate.to(
-                dtype=base_tensor.dtype
-            )
+        combined = torch.nan_to_num(
+            combined,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        combined = _clip_delta_norm(
+            combined,
+            base_fp32,
+            max_norm_ratio,
+        )
+
+        result = (
+            base_fp32
+            +
+            combined
+        )
+
+        result = torch.nan_to_num(
+            result,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        merged[name] = result.to(
+            device=base_tensor.device,
+            dtype=base_tensor.dtype,
+        )
 
     return merged
 
 
 # =============================================================================
-# TIES helpers
+# Weighted merge
 # =============================================================================
 
+def weighted_merge(
+    tensors: Sequence[torch.Tensor],
+    weights: Sequence[float],
+    *,
+    reference: Optional[torch.Tensor] = None,
+    normalize_weights: bool = True,
+    max_output_ratio: Optional[float] = None,
+    sanitize: bool = True,
+) -> torch.Tensor:
+    """
+    Memory-conscious weighted average of two or more tensors.
+
+    Unlike ``torch.stack(tensors)``, this accumulates into one FP32 tensor and
+    avoids creating a [N, ...] temporary stack.
+
+    ``reference`` can be supplied to detect/cap output norm growth.
+    """
+    if not tensors:
+        raise ValueError(
+            "weighted_merge requires at least one tensor."
+        )
+
+    weights = list(weights)
+
+    if len(weights) != len(tensors):
+        raise ValueError(
+            "weights length must match tensors length."
+        )
+
+    for index, tensor in enumerate(tensors):
+        _require_floating(
+            tensor,
+            name=f"tensors[{index}]",
+        )
+
+    first = tensors[0]
+
+    for index, tensor in enumerate(tensors[1:], start=1):
+        _require_same_shape(
+            first,
+            tensor,
+            operation=f"Weighted merge tensor {index}",
+        )
+
+    final_weights = (
+        _normalize_weights(weights)
+        if normalize_weights
+        else [
+            float(weight)
+            for weight in weights
+        ]
+    )
+
+    accumulator = torch.zeros_like(
+        first,
+        dtype=torch.float32,
+    )
+
+    with torch.no_grad():
+        for tensor, weight in zip(
+            tensors,
+            final_weights,
+        ):
+            accumulator.add_(
+                tensor.detach().float(),
+                alpha=float(weight),
+            )
+
+        if sanitize:
+            accumulator = _repair_output(
+                accumulator
+            )
+
+        if (
+            reference is not None
+            and
+            max_output_ratio is not None
+        ):
+            _require_same_shape(
+                accumulator,
+                reference,
+                operation="Weighted merge reference",
+            )
+
+            ref_norm = _safe_norm(
+                reference
+            )
+
+            out_norm = _safe_norm(
+                accumulator
+            )
+
+            ratio = (
+                out_norm
+                /
+                max(
+                    ref_norm,
+                    _EPS,
+                )
+            )
+
+            if (
+                ref_norm > _EPS
+                and
+                math.isfinite(ratio)
+                and
+                ratio > float(max_output_ratio)
+            ):
+                accumulator = (
+                    accumulator
+                    *
+                    (
+                        ref_norm
+                        *
+                        float(max_output_ratio)
+                        /
+                        max(
+                            out_norm,
+                            _EPS,
+                        )
+                    )
+                )
+
+        return accumulator.to(
+            device=first.device,
+            dtype=first.dtype,
+        )
+
+
+# =============================================================================
+# Fisher-weighted merge
+# =============================================================================
+
+def fisher_merge(
+    tensors: Sequence[torch.Tensor],
+    fisher: Sequence[torch.Tensor],
+    *,
+    epsilon: float = 1e-8,
+    reference: Optional[torch.Tensor] = None,
+    max_output_ratio: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Fisher-weighted parameter merge.
+
+    For each tensor position:
+
+        merged = sum(F_i * theta_i) / sum(F_i)
+
+    This gives a parameter more influence when its estimated diagonal Fisher
+    importance is larger.
+
+    Important:
+        Fisher tensors must correspond exactly to `tensors`.
+    """
+    if not tensors:
+        raise ValueError(
+            "fisher_merge requires at least one tensor."
+        )
+
+    if len(tensors) != len(fisher):
+        raise ValueError(
+            "tensors and fisher must have the same length."
+        )
+
+    first = tensors[0]
+
+    for index, tensor in enumerate(tensors):
+        _require_floating(
+            tensor,
+            name=f"tensors[{index}]",
+        )
+
+        _require_same_shape(
+            first,
+            tensor,
+            operation=f"Fisher merge tensor {index}",
+        )
+
+    weighted_sum = torch.zeros_like(
+        first,
+        dtype=torch.float32,
+    )
+
+    importance_sum = torch.zeros_like(
+        first,
+        dtype=torch.float32,
+    )
+
+    with torch.no_grad():
+        for index, (
+            tensor,
+            fisher_tensor,
+        ) in enumerate(
+            zip(
+                tensors,
+                fisher,
+            )
+        ):
+            if not isinstance(
+                fisher_tensor,
+                torch.Tensor,
+            ):
+                raise TypeError(
+                    f"fisher[{index}] must be a tensor."
+                )
+
+            _require_same_shape(
+                tensor,
+                fisher_tensor,
+                operation=f"Fisher merge fisher[{index}]",
+            )
+
+            importance = (
+                fisher_tensor
+                .detach()
+                .float()
+            )
+
+            importance = torch.nan_to_num(
+                importance,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(
+                float(epsilon)
+            )
+
+            weighted_sum.add_(
+                tensor.detach().float()
+                *
+                importance,
+            )
+
+            importance_sum.add_(
+                importance
+            )
+
+        importance_sum.clamp_min_(
+            float(epsilon)
+        )
+
+        output = (
+            weighted_sum
+            /
+            importance_sum
+        )
+
+        output = _repair_output(
+            output
+        )
+
+        if (
+            reference is not None
+            and
+            max_output_ratio is not None
+        ):
+            ref_norm = _safe_norm(
+                reference
+            )
+
+            out_norm = _safe_norm(
+                output
+            )
+
+            if (
+                ref_norm > _EPS
+                and
+                out_norm
+                /
+                ref_norm
+                >
+                float(max_output_ratio)
+            ):
+                scale = (
+                    ref_norm
+                    *
+                    float(max_output_ratio)
+                    /
+                    max(
+                        out_norm,
+                        _EPS,
+                    )
+                )
+
+                output.mul_(
+                    scale
+                )
+
+        return output.to(
+            device=first.device,
+            dtype=first.dtype,
+        )
+
+
+# =============================================================================
+# TIES implementation
+# =============================================================================
 
 def _topk_mask(
     tensor: torch.Tensor,
     density: float,
 ) -> torch.Tensor:
-    """
-    Return a boolean mask retaining approximately ``density`` of values.
-
-    Works safely for scalar and tiny tensors.
-    """
     density = _validate_probability(
         density,
         "density",
@@ -1072,27 +1891,31 @@ def _topk_mask(
             dtype=torch.bool,
         )
 
-    if density >= 1.0:
-        return torch.ones_like(
-            tensor,
-            dtype=torch.bool,
-        )
-
-    if density <= 0.0:
+    if density <= 0:
         return torch.zeros_like(
             tensor,
             dtype=torch.bool,
         )
 
-    flat = tensor.abs().reshape(-1)
+    if density >= 1:
+        return torch.ones_like(
+            tensor,
+            dtype=torch.bool,
+        )
+
+    flat = tensor.detach().float().abs()
 
     k = max(
         1,
         min(
             flat.numel(),
-            int(math.ceil(
-                flat.numel() * density
-            )),
+            int(
+                math.ceil(
+                    flat.numel()
+                    *
+                    density
+                )
+            ),
         ),
     )
 
@@ -1103,31 +1926,25 @@ def _topk_mask(
         )
 
     threshold = torch.topk(
-        flat,
+        flat.reshape(-1),
         k=k,
         largest=True,
         sorted=False,
     ).values.min()
 
     return (
-        tensor.abs() >= threshold
+        tensor.abs()
+        >=
+        threshold
     )
 
 
 def _sign_consensus(
     deltas: Sequence[torch.Tensor],
 ) -> torch.Tensor:
-    """
-    Determine the elected TIES sign for each parameter position.
-
-    The sign with the strongest aggregate magnitude wins.
-
-    This is more robust than simply counting +1/-1 because a tiny positive
-    delta should not necessarily defeat a huge negative delta.
-    """
     if not deltas:
         raise ValueError(
-            "Cannot compute sign consensus from zero deltas."
+            "TIES requires at least one delta."
         )
 
     positive_score = torch.zeros_like(
@@ -1141,21 +1958,28 @@ def _sign_consensus(
     )
 
     for delta in deltas:
-        d = delta.float()
+        value = (
+            delta.detach()
+            .float()
+        )
 
         positive_score.add_(
             torch.where(
-                d > 0,
-                d.abs(),
-                torch.zeros_like(d),
+                value > 0,
+                value.abs(),
+                torch.zeros_like(
+                    value
+                ),
             )
         )
 
         negative_score.add_(
             torch.where(
-                d < 0,
-                d.abs(),
-                torch.zeros_like(d),
+                value < 0,
+                value.abs(),
+                torch.zeros_like(
+                    value
+                ),
             )
         )
 
@@ -1179,9 +2003,6 @@ def _ties_merge_deltas(
     density: float,
     scaling: float,
 ) -> torch.Tensor:
-    """
-    Core TIES operation on already computed deltas.
-    """
     if not deltas:
         raise ValueError(
             "TIES requires at least one delta."
@@ -1192,16 +2013,14 @@ def _ties_merge_deltas(
         "density",
     )
 
-    if not math.isfinite(float(scaling)):
+    if not math.isfinite(
+        float(scaling)
+    ):
         raise ValueError(
             "scaling must be finite."
         )
 
-    # -------------------------------------------------------------------------
-    # Trim
-    # -------------------------------------------------------------------------
-
-    trimmed: List[torch.Tensor] = []
+    trimmed = []
 
     for delta in deltas:
         mask = _topk_mask(
@@ -1213,25 +2032,15 @@ def _ties_merge_deltas(
             torch.where(
                 mask,
                 delta,
-                torch.zeros_like(delta),
+                torch.zeros_like(
+                    delta
+                ),
             )
         )
-
-    # -------------------------------------------------------------------------
-    # Elect sign.
-    # -------------------------------------------------------------------------
 
     elected_sign = _sign_consensus(
         trimmed
     )
-
-    # -------------------------------------------------------------------------
-    # Disjoint merge.
-    #
-    # Instead of constructing a huge [num_models, ...] stack, accumulate
-    # matching deltas incrementally. This significantly reduces peak memory
-    # for large models.
-    # -------------------------------------------------------------------------
 
     total = torch.zeros_like(
         trimmed[0],
@@ -1244,45 +2053,61 @@ def _ties_merge_deltas(
     )
 
     for delta in trimmed:
-        d = delta.float()
+        value = (
+            delta.detach()
+            .float()
+        )
 
         matching = (
-            torch.sign(d) == elected_sign
-        ) & (
-            elected_sign != 0
+            (
+                torch.sign(value)
+                ==
+                elected_sign
+            )
+            &
+            (
+                elected_sign
+                !=
+                0
+            )
         )
 
         total.add_(
             torch.where(
                 matching,
-                d,
-                torch.zeros_like(d),
+                value,
+                torch.zeros_like(
+                    value
+                ),
             )
         )
 
         count.add_(
-            matching.to(torch.float32)
+            matching.to(
+                torch.float32
+            )
         )
 
     count.clamp_min_(
         1.0
     )
 
-    merged_delta = (
-        total / count
-    ) * float(scaling)
+    output = (
+        total
+        /
+        count
+    )
+
+    output.mul_(
+        float(scaling)
+    )
 
     return torch.nan_to_num(
-        merged_delta,
+        output,
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
     )
-
-
-# =============================================================================
-# TIES State Dict Merge
-# =============================================================================
 
 
 def ties_merge_state_dict(
@@ -1293,40 +2118,15 @@ def ties_merge_state_dict(
     *,
     strict_shapes: bool = True,
     include_unmatched: bool = True,
+    max_delta_norm_ratio: Optional[float] = None,
+    diagnostics: Optional[MergeDiagnostics] = None,
 ) -> Dict[str, torch.Tensor]:
     """
-    TIES merge one or more models against a base model.
+    Memory-conscious TIES state-dict merge.
 
-    Parameters
-    ----------
-    models:
-        Model state dictionaries.
-
-    base:
-        Base state dictionary.
-
-    density:
-        Fraction of each model's delta retained during the trimming stage.
-
-    scaling:
-        Final delta multiplier.
-
-    strict_shapes:
-        Raise when a matching parameter name has an incompatible shape.
-
-    include_unmatched:
-        Preserve base parameters when no compatible model delta exists.
-
-    Notes
-    -----
-    This implementation intentionally avoids stacking all model deltas.
-
-    For a model with billions of parameters, constructing:
-
-        [num_models, *parameter_shape]
-
-    can create a very large temporary allocation. Instead, this version
-    processes the deltas incrementally.
+    The implementation intentionally avoids stacking deltas from all models.
+    This is important for large models where a temporary tensor with an extra
+    model dimension can exceed available RAM/VRAM.
     """
     if not models:
         raise ValueError(
@@ -1338,128 +2138,595 @@ def ties_merge_state_dict(
         "density",
     )
 
-    if not math.isfinite(float(scaling)):
+    if not math.isfinite(
+        float(scaling)
+    ):
         raise ValueError(
             "scaling must be finite."
         )
 
-    merged: Dict[str, torch.Tensor] = {}
+    output: Dict[str, torch.Tensor] = {}
 
-    statistics = {
-        "parameters": 0,
-        "merged": 0,
-        "unmatched": 0,
-        "shape_mismatch": 0,
-        "non_floating": 0,
-    }
+    if diagnostics is None:
+        diagnostics = MergeDiagnostics(
+            operation="ties"
+        )
 
-    with torch.no_grad():
+    diagnostics.total_keys = len(
+        base
+    )
+
+    for name, base_tensor in base.items():
+        if not isinstance(
+            base_tensor,
+            torch.Tensor,
+        ):
+            if include_unmatched:
+                output[name] = base_tensor
+                diagnostics.preserved_keys += 1
+            continue
+
+        if not _is_mergeable_tensor(
+            base_tensor
+        ):
+            if include_unmatched:
+                output[name] = (
+                    base_tensor.detach().clone()
+                )
+
+            diagnostics.nonfloating_keys += 1
+            diagnostics.preserved_keys += 1
+            continue
+
+        deltas: List[torch.Tensor] = []
+        contributors = 0
+
+        for model_index, model_state in enumerate(
+            models
+        ):
+            tensor = model_state.get(
+                name
+            )
+
+            if tensor is None:
+                continue
+
+            if not _is_mergeable_tensor(
+                tensor
+            ):
+                diagnostics.nonfloating_keys += 1
+                continue
+
+            if not _same_shape(
+                tensor,
+                base_tensor,
+            ):
+                diagnostics.shape_mismatch_keys += 1
+
+                if strict_shapes:
+                    raise ValueError(
+                        f"TIES merge: shape mismatch for {name!r}: "
+                        f"base={tuple(base_tensor.shape)}, "
+                        f"model[{model_index}]="
+                        f"{tuple(tensor.shape)}."
+                    )
+
+                continue
+
+            delta = (
+                tensor.detach().float()
+                -
+                base_tensor.detach().float()
+            )
+
+            delta = torch.nan_to_num(
+                delta,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+            deltas.append(
+                delta
+            )
+            contributors += 1
+
+        if not deltas:
+            if include_unmatched:
+                output[name] = (
+                    base_tensor.detach().clone()
+                )
+                diagnostics.preserved_keys += 1
+            else:
+                diagnostics.skipped_keys += 1
+            continue
+
+        final_delta = _ties_merge_deltas(
+            deltas,
+            density=density,
+            scaling=scaling,
+        )
+
+        if max_delta_norm_ratio is not None:
+            final_delta = _clip_delta_norm(
+                final_delta,
+                base_tensor.float(),
+                max_delta_norm_ratio,
+            )
+
+        candidate = (
+            base_tensor.detach().float()
+            +
+            final_delta
+        )
+
+        candidate = _repair_output(
+            candidate
+        )
+
+        output_tensor = candidate.to(
+            device=base_tensor.device,
+            dtype=base_tensor.dtype,
+        )
+
+        output[name] = output_tensor
+        diagnostics.merged_keys += 1
+
+        base_norm = _safe_norm(
+            base_tensor
+        )
+
+        output_norm = _safe_norm(
+            output_tensor
+        )
+
+        ratio = (
+            output_norm
+            /
+            max(
+                base_norm,
+                _EPS,
+            )
+        )
+
+        if math.isfinite(ratio):
+            diagnostics.max_output_ratio = max(
+                diagnostics.max_output_ratio,
+                ratio,
+            )
+            diagnostics.min_output_ratio = min(
+                diagnostics.min_output_ratio,
+                ratio,
+            )
+
+        diagnostics.per_key[name] = {
+            "contributors": contributors,
+            "output_ratio": ratio,
+            "density": density,
+            "scaling": float(scaling),
+        }
+
+    ratios = [
+        value["output_ratio"]
+        for value in diagnostics.per_key.values()
+        if math.isfinite(
+            value["output_ratio"]
+        )
+    ]
+
+    if ratios:
+        diagnostics.mean_output_ratio = (
+            sum(ratios)
+            /
+            len(ratios)
+        )
+
+    return output
+
+
+# =============================================================================
+# Generic multi-model state-dict merge
+# =============================================================================
+
+def merge_state_dicts(
+    models: Sequence[Mapping[str, torch.Tensor]],
+    *,
+    weights: Optional[Sequence[float]] = None,
+    base: Optional[Mapping[str, torch.Tensor]] = None,
+    method: str = "weighted",
+    density: float = 0.2,
+    scaling: float = 1.0,
+    drop_rate: float = 0.9,
+    seed: Optional[int] = None,
+    strict_shapes: bool = True,
+    preserve_unmatched: bool = True,
+    max_delta_norm_ratio: Optional[float] = 2.5,
+    fisher: Optional[
+        Sequence[
+            Mapping[str, torch.Tensor]
+        ]
+    ] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Unified merge entry point for FTRAIN.
+
+    Supported methods
+    -----------------
+    weighted:
+        Weighted parameter average.
+
+    ties:
+        TIES deltas relative to `base`.
+
+    dare:
+        Sequential DARE application relative to the first model.
+
+    task_arithmetic:
+        Sum task deltas relative to `base`.
+
+    fisher:
+        Fisher-weighted parameter merge.
+
+    This function intentionally stays architecture-agnostic.
+    """
+    if not models:
+        raise ValueError(
+            "models cannot be empty."
+        )
+
+    method = str(
+        method
+    ).strip().lower()
+
+    if weights is None:
+        weights = [
+            1.0
+            for _ in models
+        ]
+
+    if len(weights) != len(models):
+        raise ValueError(
+            "weights must have the same length as models."
+        )
+
+    normalized_weights = _normalize_weights(
+        weights
+    )
+
+    if method == "ties":
+        if base is None:
+            raise ValueError(
+                "TIES requires base."
+            )
+
+        diagnostics = MergeDiagnostics(
+            operation="ties"
+        )
+
+        return ties_merge_state_dict(
+            list(models),
+            base,
+            density=density,
+            scaling=scaling,
+            strict_shapes=strict_shapes,
+            include_unmatched=preserve_unmatched,
+            max_delta_norm_ratio=max_delta_norm_ratio,
+            diagnostics=diagnostics,
+        )
+
+    if method == "task_arithmetic":
+        if base is None:
+            raise ValueError(
+                "task_arithmetic requires base."
+            )
+
+        # Generalize task arithmetic to N models by summing weighted deltas.
+        result: Dict[str, torch.Tensor] = {}
+
         for name, base_tensor in base.items():
-            statistics["parameters"] += 1
-
-            if not isinstance(base_tensor, torch.Tensor):
-                if include_unmatched:
-                    merged[name] = base_tensor
-
-                statistics["unmatched"] += 1
+            if not isinstance(
+                base_tensor,
+                torch.Tensor,
+            ):
                 continue
 
-            if not _is_mergeable_tensor(base_tensor):
-                if include_unmatched:
-                    merged[name] = base_tensor.clone()
-
-                statistics["non_floating"] += 1
+            if not _is_mergeable_tensor(
+                base_tensor
+            ):
+                result[name] = (
+                    base_tensor.detach().clone()
+                )
                 continue
 
-            deltas: List[torch.Tensor] = []
+            accumulator = torch.zeros_like(
+                base_tensor,
+                dtype=torch.float32,
+            )
 
-            for model_index, model_state in enumerate(models):
-                tensor = model_state.get(name)
+            found = False
+
+            for model_state, weight in zip(
+                models,
+                normalized_weights,
+            ):
+                tensor = model_state.get(
+                    name
+                )
 
                 if tensor is None:
                     continue
 
-                if not _is_mergeable_tensor(tensor):
-                    logger.debug(
-                        "TIES ignored non-floating tensor %s from model %d.",
-                        name,
-                        model_index,
-                    )
+                if not _is_mergeable_tensor(
+                    tensor
+                ):
                     continue
 
                 if not _same_shape(
                     tensor,
                     base_tensor,
                 ):
-                    statistics["shape_mismatch"] += 1
-
                     if strict_shapes:
                         raise ValueError(
-                            f"TIES merge: shape mismatch for parameter "
-                            f"{name!r}: base={tuple(base_tensor.shape)}, "
-                            f"model[{model_index}]="
-                            f"{tuple(tensor.shape)}."
+                            f"task_arithmetic merge: shape mismatch "
+                            f"for {name!r}."
                         )
-
                     continue
 
                 delta = (
-                    tensor.float()
-                    - base_tensor.float()
+                    tensor.detach().float()
+                    -
+                    base_tensor.detach().float()
                 )
 
-                delta = torch.nan_to_num(
+                accumulator.add_(
                     delta,
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
+                    alpha=float(weight),
                 )
 
-                deltas.append(
-                    delta
-                )
+                found = True
 
-            if not deltas:
-                if include_unmatched:
-                    merged[name] = base_tensor.clone()
-
-                statistics["unmatched"] += 1
+            if not found:
+                if preserve_unmatched:
+                    result[name] = (
+                        base_tensor.detach().clone()
+                    )
                 continue
 
-            final_delta = _ties_merge_deltas(
-                deltas,
-                density=density,
-                scaling=scaling,
-            )
+            if max_delta_norm_ratio is not None:
+                accumulator = _clip_delta_norm(
+                    accumulator,
+                    base_tensor.float(),
+                    max_delta_norm_ratio,
+                )
 
             candidate = (
                 base_tensor.float()
-                + final_delta
+                +
+                float(scaling)
+                *
+                accumulator
             )
 
-            candidate = torch.nan_to_num(
-                candidate,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
+            result[name] = (
+                _repair_output(
+                    candidate
+                )
+                .to(
+                    device=base_tensor.device,
+                    dtype=base_tensor.dtype,
+                )
             )
 
-            merged[name] = candidate.to(
-                dtype=base_tensor.dtype
+        return result
+
+    if method == "dare":
+        result = (
+            models[0]
+        )
+
+        for index, model_state in enumerate(
+            models[1:]
+        ):
+            pair_seed = (
+                None
+                if seed is None
+                else int(seed) + index
             )
 
-            statistics["merged"] += 1
+            result = dare_merge_state_dict(
+                result,
+                model_state,
+                drop_rate=drop_rate,
+                rescale=True,
+                seed=pair_seed,
+                strict_shapes=strict_shapes,
+                preserve_unmatched=preserve_unmatched,
+            )
 
-    logger.info(
-        "TIES merge complete: "
-        "%d/%d parameters merged, "
-        "%d unmatched, %d shape mismatches, "
-        "%d non-floating.",
-        statistics["merged"],
-        statistics["parameters"],
-        statistics["unmatched"],
-        statistics["shape_mismatch"],
-        statistics["non_floating"],
+        return result
+
+    if method == "fisher":
+        if fisher is None:
+            raise ValueError(
+                "Fisher merge requires fisher data."
+            )
+
+        if len(fisher) != len(models):
+            raise ValueError(
+                "fisher must have one state dictionary per model."
+            )
+
+        result: Dict[str, torch.Tensor] = {}
+
+        if base is None:
+            base = models[0]
+
+        for name, fallback_tensor in base.items():
+            tensors_here = []
+            fisher_here = []
+
+            for model_state, fisher_state in zip(
+                models,
+                fisher,
+            ):
+                tensor = model_state.get(
+                    name
+                )
+
+                fisher_tensor = fisher_state.get(
+                    name
+                )
+
+                if (
+                    tensor is None
+                    or
+                    fisher_tensor is None
+                ):
+                    continue
+
+                if not _is_mergeable_tensor(
+                    tensor
+                ):
+                    continue
+
+                if not _same_shape(
+                    tensor,
+                    fallback_tensor,
+                ):
+                    if strict_shapes:
+                        raise ValueError(
+                            f"fisher merge: shape mismatch for {name!r}."
+                        )
+                    continue
+
+                if not _same_shape(
+                    tensor,
+                    fisher_tensor,
+                ):
+                    raise ValueError(
+                        f"fisher merge: Fisher shape mismatch for {name!r}."
+                    )
+
+                tensors_here.append(
+                    tensor
+                )
+
+                fisher_here.append(
+                    fisher_tensor
+                )
+
+            if not tensors_here:
+                if preserve_unmatched:
+                    result[name] = (
+                        fallback_tensor.detach().clone()
+                    )
+                continue
+
+            result[name] = fisher_merge(
+                tensors_here,
+                fisher_here,
+                reference=fallback_tensor,
+                max_output_ratio=(
+                    max_delta_norm_ratio
+                    if max_delta_norm_ratio is not None
+                    else None
+                ),
+            )
+
+        return result
+
+    if method == "weighted":
+        result: Dict[str, torch.Tensor] = {}
+
+        if base is None:
+            base = models[0]
+
+        for name, fallback_tensor in base.items():
+            if not isinstance(
+                fallback_tensor,
+                torch.Tensor,
+            ):
+                continue
+
+            compatible = []
+
+            compatible_weights = []
+
+            for model_state, weight in zip(
+                models,
+                normalized_weights,
+            ):
+                tensor = model_state.get(
+                    name
+                )
+
+                if tensor is None:
+                    continue
+
+                if not _is_mergeable_tensor(
+                    tensor
+                ):
+                    continue
+
+                if not _same_shape(
+                    tensor,
+                    fallback_tensor,
+                ):
+                    if strict_shapes:
+                        raise ValueError(
+                            f"weighted merge: shape mismatch for {name!r}."
+                        )
+                    continue
+
+                compatible.append(
+                    tensor
+                )
+
+                compatible_weights.append(
+                    weight
+                )
+
+            if not compatible:
+                if preserve_unmatched:
+                    result[name] = (
+                        fallback_tensor.detach().clone()
+                    )
+                continue
+
+            result[name] = weighted_merge(
+                compatible,
+                compatible_weights,
+                reference=fallback_tensor,
+                max_output_ratio=(
+                    max_delta_norm_ratio
+                    if max_delta_norm_ratio is not None
+                    else None
+                ),
+            )
+
+        return result
+
+    raise ValueError(
+        f"Unknown merge method {method!r}. "
+        "Expected weighted, ties, dare, task_arithmetic, or fisher."
     )
 
-    return merged
+
+# =============================================================================
+# Backward-compatible aliases / final exports
+# =============================================================================
+
+__all__ = [
+    "MergeConfig",
+    "MergeDiagnostics",
+    "compute_fisher",
+    "dare_merge",
+    "task_arithmetic",
+    "weighted_merge",
+    "fisher_merge",
+    "ties_merge_state_dict",
+    "dare_merge_state_dict",
+    "merge_state_dicts",
+    "calculate_delta",
+    "detect_tensor_health",
+]
