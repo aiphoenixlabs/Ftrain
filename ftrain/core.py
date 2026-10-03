@@ -565,6 +565,14 @@ class Ftrain:
         if self.model is None:
             raise RuntimeError("FTRAIN training requires a loaded model.")
 
+        if not isinstance(self.model, torch.nn.Module):
+            raise TypeError(
+                "FTRAIN training requires self.model to be a torch.nn.Module; "
+                f"got {type(self.model).__name__}. "
+                "This usually means an adapter injector returned a module-count "
+                "integer instead of the model object."
+            )
+
         devices = set()
         for name, parameter in self.model.named_parameters():
             if not parameter.requires_grad:
@@ -1242,11 +1250,6 @@ class Ftrain:
 
             self._prepare_tokenizer()
             self._prepare_model()
-            if not isinstance(self.model, torch.nn.Module):
-                raise TypeError(
-                    "FTRAIN model load produced an invalid model object: "
-                    f"{type(self.model).__name__}."
-                )
             self._assert_training_device_coherence()
 
         finally:
@@ -1331,6 +1334,63 @@ class Ftrain:
             )
 
         self._assert_training_device_coherence()
+
+    def _prepare_tokenizer(self) -> None:
+        tokenizer = self.tokenizer
+
+        if tokenizer is None:
+            raise RuntimeError(
+                "Tokenizer is unavailable."
+            )
+
+        if getattr(
+            tokenizer,
+            "pad_token_id",
+            None,
+        ) is None:
+            eos_token = getattr(
+                tokenizer,
+                "eos_token",
+                None,
+            )
+
+            if eos_token is not None:
+                tokenizer.pad_token = eos_token
+            else:
+                logger.warning(
+                    "Tokenizer has neither pad_token nor eos_token."
+                )
+
+        try:
+            tokenizer.padding_side = "right"
+        except Exception:
+            pass
+
+    def _prepare_model(self) -> None:
+        if self.model is None:
+            raise RuntimeError(
+                "Model is unavailable."
+            )
+
+        try:
+            device_map = getattr(
+                self.model,
+                "hf_device_map",
+                None,
+            )
+
+            if device_map:
+                return
+
+            self.model.to(
+                self.device
+            )
+
+        except Exception:
+            logger.debug(
+                "FTRAIN: model .to(device) skipped.",
+                exc_info=True,
+            )
 
     # =========================================================================
     # Data
@@ -1596,11 +1656,26 @@ class Ftrain:
     # =========================================================================
 
     def _apply_adapters(self) -> None:
+        """Apply LoRA/DoRA without ever replacing the model with an injection count.
+
+        FTRAIN's custom ``inject``/``inject_dora`` implementations modify the
+        model in-place and return an integer count of replaced modules. Older
+        versions of core.py assigned that return value to ``self.model`` which
+        turned the model into an ``int`` and later crashed at
+        ``self.model.named_parameters()``. This implementation accepts both
+        in-place injectors (int/None return) and model-returning backends.
+        """
         cfg = self.config
 
         if self.model is None:
             raise RuntimeError(
                 "Cannot apply adapters without a model."
+            )
+
+        if not isinstance(self.model, torch.nn.Module):
+            raise TypeError(
+                "FTRAIN internal error: self.model must be a torch.nn.Module "
+                f"before adapter injection, got {type(self.model).__name__}."
             )
 
         targets = list(
@@ -1665,76 +1740,74 @@ class Ftrain:
                 ):
                     kwargs["bias"] = "none"
 
-                self.model = fn(
-                    self.model,
+                original_model = self.model
+                result = fn(
+                    original_model,
                     **kwargs,
                 )
 
-            elif cfg.use_custom_lora:
-                if cfg.use_dora:
-                    # Custom DoRA injectors in FTRAIN modify the model in-place
-                    # and may return the number of replaced modules. Never store
-                    # that integer in self.model.
-                    adapter_result = inject_dora(
-                        self.model,
-                        targets,
-                        cfg.lora_r,
-                        cfg.lora_alpha,
-                    )
-                    if isinstance(adapter_result, torch.nn.Module):
-                        self.model = adapter_result
-                    elif isinstance(adapter_result, int):
-                        if adapter_result <= 0:
-                            raise RuntimeError(
-                                "Custom DoRA injection replaced 0 modules. "
-                                f"Requested targets: {targets}"
-                            )
-                        logger.info(
-                            "FTRAIN: custom DoRA injected into %d modules.",
-                            adapter_result,
-                        )
-                    elif adapter_result is not None:
-                        raise TypeError(
-                            "Custom DoRA injector returned an unsupported value "
-                            f"of type {type(adapter_result).__name__}."
-                        )
+                # Most Unsloth releases return the adapted model. Keep that
+                # behavior, but fail clearly if a broken backend returns a
+                # non-model object.
+                if isinstance(result, torch.nn.Module):
+                    self.model = result
+                elif result is None:
+                    # Defensive compatibility for in-place implementations.
+                    self.model = original_model
                 else:
-                    # Same compatibility rule for the custom LoRA injector.
-                    adapter_result = inject_lora(
-                        self.model,
+                    raise TypeError(
+                        "Unsloth get_peft_model returned "
+                        f"{type(result).__name__}, expected torch.nn.Module "
+                        "or None."
+                    )
+
+            elif cfg.use_custom_lora:
+                # The native FTRAIN injectors mutate ``self.model`` in-place
+                # and return the number of replaced modules. Never assign
+                # that integer to self.model.
+                original_model = self.model
+
+                if cfg.use_dora:
+                    result = inject_dora(
+                        original_model,
                         targets,
                         cfg.lora_r,
                         cfg.lora_alpha,
                     )
-                    if isinstance(adapter_result, torch.nn.Module):
-                        self.model = adapter_result
-                    elif isinstance(adapter_result, int):
-                        if adapter_result <= 0:
-                            raise RuntimeError(
-                                "Custom LoRA injection replaced 0 modules. "
-                                f"Requested targets: {targets}"
-                            )
-                        logger.info(
-                            "FTRAIN: custom LoRA injected into %d modules.",
-                            adapter_result,
-                        )
-                    elif adapter_result is not None:
-                        raise TypeError(
-                            "Custom LoRA injector returned an unsupported value "
-                            f"of type {type(adapter_result).__name__}."
-                        )
+                else:
+                    result = inject_lora(
+                        original_model,
+                        targets,
+                        cfg.lora_r,
+                        cfg.lora_alpha,
+                    )
 
-            if not isinstance(self.model, torch.nn.Module):
-                raise TypeError(
-                    "FTRAIN adapter setup corrupted self.model: expected "
-                    f"torch.nn.Module, got {type(self.model).__name__}. "
-                    "Custom LoRA/DoRA injectors must return a model or mutate "
-                    "the existing model in-place and return a replacement count."
-                )
+                if isinstance(result, torch.nn.Module):
+                    self.model = result
+                elif result is None or isinstance(result, int):
+                    # In-place injector: keep the real model object.
+                    self.model = original_model
+                    logger.info(
+                        "FTRAIN: custom adapter injected in-place (%s modules).",
+                        "unknown" if result is None else int(result),
+                    )
+                else:
+                    raise TypeError(
+                        "Custom adapter injector returned "
+                        f"{type(result).__name__}; expected torch.nn.Module, "
+                        "int, or None."
+                    )
 
             else:
                 logger.info(
                     "FTRAIN: adapter backend disabled."
+                )
+
+            # Final invariant: the rest of FTRAIN may safely assume a model.
+            if not isinstance(self.model, torch.nn.Module):
+                raise TypeError(
+                    "FTRAIN adapter stage left self.model as "
+                    f"{type(self.model).__name__}; expected torch.nn.Module."
                 )
 
         except Exception as exc:
