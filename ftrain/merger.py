@@ -2485,4 +2485,919 @@ Return ONLY one JSON object:
             return _merge_ties(a, b, extent, alpha, decision.sign_conflict, chunk), {**info, "op": "ties"}
         if strategy == "slerp":
             return _merge_slerp(a, b, extent, alpha, chunk), {**info, "op": "slerp"}
-        return _merge_weighted(a, b, extent, 
+        return _merge_weighted(a, b, extent, alpha, chunk), {**info, "op": "weighted"}
+
+    def _validate_result(self, a: torch.Tensor, merged: torch.Tensor) -> Tuple[bool, str]:
+        if not _finite(merged):
+            return False, "non-finite values after merge"
+        na, nm = _tensor_norm(a), _tensor_norm(merged)
+        if na > 1e-8:
+            ratio = nm / na
+            if ratio > self.explosion_ratio or ratio < self.collapse_ratio:
+                return False, f"norm ratio {ratio:.3f} outside [{self.collapse_ratio}, {self.explosion_ratio}]"
+        return True, ""
+
+    # ------------------------------------------------------------------
+    # vocabulary (embedding / lm_head) merge
+    # ------------------------------------------------------------------
+
+    def _merge_vocab_tensor(
+        self, key_a: str, match: TensorMatch, a: torch.Tensor, alpha_scale: float,
+        cached: Optional[MergeTensorDecision],
+    ) -> Tuple[Optional[torch.Tensor], MergeTensorDecision]:
+        role = match.role
+        src_key = match.sources[0][0]
+        b_raw = self._sd_b[src_key]
+        shape_a, shape_b = tuple(a.shape), tuple(b_raw.shape)
+        decision = MergeTensorDecision(
+            target_key=key_a, source_key=src_key, role=role, strategy="weighted",
+            alpha_b=0.0, protected=self._is_protected(role), match_method=match.method,
+            source_keys=[src_key], source_weights=[1.0], layer_a=None, layer_b=None,
+            shape_a=shape_a, shape_b=shape_b,
+        )
+        vm = self._vocab_map
+        if a.ndim != 2 or b_raw.ndim != 2:
+            decision.status, decision.reason, decision.keep_a = "kept_a", "vocabulary tensor is not 2-D", True
+            return None, decision
+        if vm is None and shape_a[0] != shape_b[0]:
+            decision.status, decision.keep_a = "kept_a", True
+            decision.reason = "different vocabulary sizes and no token map available (kept A)"
+            return None, decision
+        if vm is None or vm.numel() != shape_a[0]:
+            if shape_a[0] == shape_b[0]:
+                vm_use = torch.arange(shape_a[0])
+            else:
+                decision.status, decision.keep_a = "kept_a", True
+                decision.reason = "token map does not match this tensor (kept A)"
+                return None, decision
+        else:
+            vm_use = vm
+        rows = (vm_use >= 0).nonzero(as_tuple=False).squeeze(1)
+        if rows.numel() == 0:
+            decision.status, decision.keep_a, decision.reason = "kept_a", True, "no token overlap"
+            return None, decision
+
+        hid_a, hid_b = shape_a[1], shape_b[1]
+        sample_rows = rows[:: max(1, rows.numel() // _VOCAB_ROW_SAMPLE)]
+
+        def adapt_cols(block: torch.Tensor) -> Tuple[torch.Tensor, int, str]:
+            if hid_a == hid_b:
+                return block, hid_a, "none"
+            return _resample_axis(block, 1, hid_a, "hidden", 0, 0, self.policy.shape_strategy)
+
+        b_sample, extent_cols, method = adapt_cols(b_raw.index_select(0, vm_use[sample_rows]).float())
+        a_sample = a.index_select(0, sample_rows)[:, :extent_cols]
+        rel = _relation(a_sample, b_sample[:, :extent_cols])
+        adapted = _Adapted(
+            b_sample, (a_sample.shape[0], extent_cols),
+            f"vocab_rows+hidden:{method}", hid_a != hid_b or shape_a[0] != shape_b[0],
+            (rows.numel() / shape_a[0]) * (extent_cols / hid_a),
+        )
+        decision_new = cached or self._make_decision(key_a, match, rel, a, adapted, [src_key])
+        decision_new.shape_b = shape_b
+        decision_new.strategy = "weighted"
+        decision_new.shape_aligned = True
+        decision_new.adaptation = adapted.method
+        decision_new.coverage = adapted.coverage
+        decision_new.extra["token_map"] = self._vocab_info.get("status")
+        decision_new.extra["mapped_rows"] = int(rows.numel())
+        decision_new.alpha_effective = decision_new.alpha_base * alpha_scale
+        decision_new.alpha_effective = min(decision_new.alpha_effective, self._alpha_ceiling)
+
+        if decision_new.keep_a or decision_new.alpha_effective <= 0.0:
+            decision_new.status = "kept_a"
+            return None, decision_new
+
+        scale = 1.0
+        if rel["rms_b"] > 1e-12 and rel["rms_a"] > 1e-12:
+            scale = _clamp(rel["rms_a"] / rel["rms_b"], 0.05, 20.0)
+        alpha = decision_new.alpha_effective
+        out = a.clone().float()
+        step = max(1, self.chunk_elements // max(1, hid_a))
+        for start in range(0, rows.numel(), step):
+            r = rows[start : start + step]
+            b_c = b_raw.index_select(0, vm_use[r]).float()
+            b_c, ext, _ = adapt_cols(b_c)
+            b_c = b_c[:, :ext] * scale
+            a_c = out.index_select(0, r)[:, :ext]
+            out[r, :ext] = a_c + alpha * (b_c - a_c)
+        decision_new.extra["rms_scale"] = round(scale, 4)
+        decision_new.status = "merged"
+        return out, decision_new
+
+    # ------------------------------------------------------------------
+    # one tensor, end to end
+    # ------------------------------------------------------------------
+
+    def _process_tensor(self, key_a: str, alpha_scale: float) -> Tuple[Optional[torch.Tensor], MergeTensorDecision]:
+        tensor_a = self._sd_a[key_a]
+        match = self._matches[key_a]
+        role, kind = match.role, match.kind
+        base = MergeTensorDecision(
+            target_key=key_a, source_key=None, role=role, strategy="weighted", alpha_b=0.0,
+            match_method=match.method, layer_a=match.layer_a, layer_b=match.layer_b,
+            shape_a=tuple(tensor_a.shape),
+        )
+        if not match.sources:
+            base.status, base.keep_a, base.reason = "kept_a", True, match.reason or "no counterpart"
+            return None, base
+        if not _finite(tensor_a):
+            base.status, base.keep_a, base.reason = "kept_a", True, "target tensor already contains non-finite values"
+            return None, base
+
+        cached = self._decision_cache.get(key_a)
+
+        # token-aware path for embedding / lm_head
+        if role in _VOCAB_ROLES and tensor_a.ndim == 2:
+            if not self.vocab_mapping and tensor_a.shape != self._sd_b[match.sources[0][0]].shape:
+                base.status, base.keep_a = "kept_a", True
+                base.reason = "vocabulary mapping disabled and shapes differ"
+                return None, base
+            out, decision = self._merge_vocab_tensor(key_a, match, tensor_a.detach().float(), alpha_scale, cached)
+            if out is None:
+                return None, decision
+            ok, why = self._validate_result(tensor_a, out)
+            if not ok:
+                decision.status, decision.keep_a = "reverted", True
+                decision.reason += f"; reverted to A: {why}"
+                return None, decision
+            self._decision_cache[key_a] = decision
+            return out, decision
+
+        device = self._compute_device(tensor_a.numel())
+        try:
+            a = tensor_a.detach().to(device=device, dtype=torch.float32)
+            adapted, gather_notes = self._gather_source(match, a)
+            if adapted is None:
+                base.status, base.keep_a = "kept_a", True
+                base.reason = "; ".join(gather_notes) or "source unusable"
+                return None, base
+            b = adapted.tensor.to(device)
+            extent = adapted.valid_shape
+            region = _region(extent) if extent else ()
+
+            if cached is None:
+                rel = _relation(a[region], b[region])
+                decision = self._make_decision(key_a, match, rel, a, adapted, [s for s, _ in match.sources])
+                decision.notes.extend(gather_notes)
+            else:
+                decision = cached
+                rel = {
+                    "cosine": decision.cosine, "relative_delta": decision.relative_delta,
+                    "sign_conflict": decision.sign_conflict, "overlap": decision.overlap,
+                    "norm_a": decision.norm_a, "norm_b": decision.norm_b,
+                    "rms_a": decision.extra.get("rms_a", 0.0), "rms_b": decision.extra.get("rms_b", 0.0),
+                }
+            decision.extra["rms_a"] = rel["rms_a"]
+            decision.extra["rms_b"] = rel["rms_b"]
+            decision.alpha_effective = min(decision.alpha_base * alpha_scale, self._alpha_ceiling)
+
+            merged, info = self._execute(decision, key_a, a, b, extent, rel, role, kind)
+            decision.extra.update(info)
+            if decision.keep_a or info.get("op") == "keep_a":
+                decision.status = "kept_a"
+                return None, decision
+            ok, why = self._validate_result(a, merged)
+            if not ok:
+                decision.status, decision.keep_a = "reverted", True
+                decision.reason += f"; reverted to A: {why}"
+                return None, decision
+            decision.status = "merged"
+            self._decision_cache[key_a] = decision
+            return merged.to("cpu"), decision
+        except Exception as exc:
+            if _is_oom(exc) and device.type == "cuda":
+                self._purge_memory()
+                self._warn(f"GPU OOM while merging {key_a}; retrying on CPU.")
+                saved = self.merge_accelerator
+                self.merge_accelerator = False
+                try:
+                    return self._process_tensor(key_a, alpha_scale)
+                finally:
+                    self.merge_accelerator = saved
+            base.status, base.keep_a = "kept_a", True
+            base.reason = f"merge failed ({type(exc).__name__}: {exc}); kept A"
+            self._warn(f"{key_a}: {base.reason}")
+            return None, base
+
+    # ------------------------------------------------------------------
+    # full merge pass
+    # ------------------------------------------------------------------
+
+    def _merge_pass(self, alpha_scale: float) -> Dict[str, Any]:
+        merged: Dict[str, torch.Tensor] = {}
+        decisions: List[MergeTensorDecision] = []
+        keys = [
+            k for k, t in self._sd_a.items()
+            if torch.is_tensor(t) and torch.is_floating_point(t) and k not in self._tie_alias
+        ]
+        total = len(keys)
+        next_report = 0.1
+        for i, key in enumerate(keys):
+            if (i + 1) / max(1, total) >= next_report:
+                self._say(f"[merge] tensors {i + 1}/{total}")
+                next_report += 0.1
+            tensor, decision = self._process_tensor(key, alpha_scale)
+            decisions.append(decision)
+            if tensor is not None:
+                merged[key] = tensor.to(self._save_dtype)
+            del tensor
+        for alias, rep in self._tie_alias.items():
+            if rep in merged:
+                merged[alias] = merged[rep]
+            alias_decision = MergeTensorDecision(
+                target_key=alias, source_key=None, role=self._sig_a.get(alias, (None, "other", ""))[1],
+                status="merged" if rep in merged else "kept_a", keep_a=rep not in merged,
+                reason=f"tied to {rep}",
+            )
+            decisions.append(alias_decision)
+        return {"merged": merged, "decisions": decisions}
+
+    def _apply_merged(self, merged: Mapping[str, torch.Tensor]) -> None:
+        model = self._model_a_obj
+        with torch.no_grad():
+            params = dict(model.named_parameters(remove_duplicate=False)) if "remove_duplicate" in inspect.signature(model.named_parameters).parameters else dict(model.named_parameters())
+            for key, tensor in merged.items():
+                target = params.get(key)
+                if target is None:
+                    continue
+                target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+
+    # ------------------------------------------------------------------
+    # targeted repair
+    # ------------------------------------------------------------------
+
+    def _select_repair_keys(self, model: nn.Module) -> List[str]:
+        names = {n for n, _ in model.named_parameters()}
+        ranked = sorted(
+            (d for d in self._merge_records if d.status == "merged" and not d.protected and d.target_key in names),
+            key=lambda d: d.sign_conflict * 2.0 + d.relative_delta + (1.0 - max(-1.0, min(1.0, d.cosine))),
+            reverse=True,
+        )
+        out: List[str] = []
+        for d in ranked:
+            if d.role in _VOCAB_ROLES or d.strategy not in ("ties", "weighted", "fisher", "slerp", "svd"):
+                continue
+            out.append(d.target_key)
+            if len(out) >= self.adaptation_max_tensors:
+                break
+        return out
+
+    def _targeted_adaptation(self, model: nn.Module, device: torch.device) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "enabled": False, "steps": 0, "initial_loss": float("inf"), "final_loss": float("inf"),
+            "best_loss": float("inf"), "rolled_back": False, "repair_tensors": [], "skipped_reason": None,
+        }
+        steps_wanted = int(self.policy.adaptation_steps or 0)
+        if not self.adaptation_enabled or steps_wanted <= 0 or self._loader_train is None:
+            result["skipped_reason"] = "disabled or no calibration data"
+            return result
+        n_params = sum(p.numel() for p in model.parameters())
+        if n_params > self.repair_max_params:
+            result["skipped_reason"] = f"model too large for repair ({n_params:,} params)"
+            return result
+        if next(model.parameters()).dtype != torch.float32:
+            result["skipped_reason"] = "repair needs a float32 container"
+            return result
+        repair_keys = self._select_repair_keys(model)
+        if not repair_keys:
+            result["skipped_reason"] = "no repair candidates"
+            return result
+
+        device = self._to_device_safely(model, device)
+        repair_set = set(repair_keys)
+        trainable: List[torch.nn.Parameter] = []
+        for name, p in model.named_parameters():
+            p.requires_grad = name in repair_set
+            if p.requires_grad:
+                trainable.append(p)
+        original = {n: p.detach().clone() for n, p in model.named_parameters() if n in repair_set}
+        optimizer = torch.optim.AdamW(
+            trainable, lr=self.policy.adaptation_lr, weight_decay=self.adaptation_weight_decay
+        )
+        initial = self._evaluate_model(model, self._loader_val, device, max_batches=8)
+        result.update(enabled=True, initial_loss=initial, best_loss=initial, repair_tensors=repair_keys)
+        if not math.isfinite(initial):
+            result.update(enabled=False, skipped_reason="initial calibration loss not finite")
+            for p in model.parameters():
+                p.requires_grad = True
+            return result
+
+        best_loss = initial
+        best_state = {n: t.clone() for n, t in original.items()}
+        eval_every = max(5, steps_wanted // 5)
+        iterator = iter(self._loader_train)
+        done = 0
+        for step in range(steps_wanted):
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                iterator = iter(self._loader_train)
+                batch = next(iterator)
+            optimizer.zero_grad(set_to_none=True)
+            try:
+                model.train()
+                loss = model(**self._move_batch(batch, device)).loss
+                if loss is None or not torch.isfinite(loss):
+                    continue
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable, self.gradient_clip)
+                optimizer.step()
+                done = step + 1
+            except Exception as exc:
+                if _is_oom(exc):
+                    self._warn("OOM during targeted repair; stopping.")
+                    self._purge_memory()
+                    break
+                logger.debug("Repair step failed: %s", exc)
+                continue
+            if (step + 1) % eval_every == 0 or step == steps_wanted - 1:
+                val = self._evaluate_model(model, self._loader_val, device, max_batches=8)
+                if math.isfinite(val) and val < best_loss:
+                    best_loss = val
+                    best_state = {n: p.detach().clone() for n, p in model.named_parameters() if n in repair_set}
+        result["steps"] = done
+
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if name in best_state:
+                    p.copy_(best_state[name].to(p.device, p.dtype))
+        final = self._evaluate_model(model, self._loader_val, device, max_batches=8)
+        result.update(final_loss=final, best_loss=best_loss)
+        if math.isfinite(final) and final > initial * (1.0 + self.rollback_tolerance):
+            self._warn("Targeted repair degraded the calibration loss; rolling the repair back.")
+            with torch.no_grad():
+                for name, p in model.named_parameters():
+                    if name in original:
+                        p.copy_(original[name].to(p.device, p.dtype))
+            result["rolled_back"] = True
+            result["final_loss"] = self._evaluate_model(model, self._loader_val, device, max_batches=8)
+        for p in model.parameters():
+            p.requires_grad = True
+        result["improvement"] = (initial - result["final_loss"]) / max(abs(initial), 1e-8)
+        return result
+
+    # ------------------------------------------------------------------
+    # saving
+    # ------------------------------------------------------------------
+
+    _WEIGHT_FILE_RE = re.compile(
+        r"^(model(-\d+-of-\d+)?\.safetensors|model\.safetensors\.index\.json|"
+        r"pytorch_model(-\d+-of-\d+)?\.bin|pytorch_model\.bin\.index\.json)$"
+    )
+
+    def _weights_present(self, out_dir: str) -> Tuple[bool, List[Dict[str, Any]]]:
+        files: List[Dict[str, Any]] = []
+        for name in sorted(os.listdir(out_dir)):
+            if self._WEIGHT_FILE_RE.match(name):
+                path = os.path.join(out_dir, name)
+                files.append({"name": name, "bytes": os.path.getsize(path)})
+        has_weights = any(f["bytes"] > 0 and not f["name"].endswith(".json") for f in files)
+        return has_weights, files
+
+    def _cleanup_partial_weights(self, out_dir: str) -> None:
+        with contextlib.suppress(Exception):
+            for name in os.listdir(out_dir):
+                if self._WEIGHT_FILE_RE.match(name):
+                    os.remove(os.path.join(out_dir, name))
+
+    @staticmethod
+    def _dedupe_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+        """CPU contiguous state dict; tensors sharing storage are stored once when
+        the config declares tied embeddings, otherwise cloned (safetensors
+        refuses shared memory)."""
+        tied = bool(getattr(getattr(model, "config", None), "tie_word_embeddings", False))
+        seen: Dict[int, str] = {}
+        out: Dict[str, torch.Tensor] = {}
+        for key, tensor in model.state_dict().items():
+            t = tensor.detach().cpu()
+            ptr = t.data_ptr() if t.numel() else 0
+            if ptr and ptr in seen:
+                role = _parse_signature(key)[1]
+                if tied and role in _VOCAB_ROLES:
+                    continue
+                t = t.clone()
+            else:
+                if ptr:
+                    seen[ptr] = key
+            out[key] = t.contiguous()
+        return out
+
+    def _manual_safetensors(self, model: nn.Module, out_dir: str) -> None:
+        from safetensors.torch import save_file  # type: ignore
+
+        save_file(self._dedupe_state_dict(model), os.path.join(out_dir, "model.safetensors"), metadata={"format": "pt"})
+        model.config.save_pretrained(out_dir)
+        with contextlib.suppress(Exception):
+            model.generation_config.save_pretrained(out_dir)
+
+    def _manual_torch_save(self, model: nn.Module, out_dir: str) -> None:
+        torch.save(self._dedupe_state_dict(model), os.path.join(out_dir, "pytorch_model.bin"))
+        model.config.save_pretrained(out_dir)
+        with contextlib.suppress(Exception):
+            model.generation_config.save_pretrained(out_dir)
+
+    def _choose_save_dtype(self, model: nn.Module) -> torch.dtype:
+        dtype = self.dtype
+        if dtype == torch.float16:
+            peak = 0.0
+            for tensor in model.state_dict().values():
+                if torch.is_tensor(tensor) and torch.is_floating_point(tensor) and tensor.numel():
+                    peak = max(peak, _safe_float(tensor.detach().abs().max()))
+            if peak > _FP16_SAFE_MAX:
+                self._warn(f"fp16 would overflow (max |w| = {peak:.1f}); saving in bf16 instead.")
+                return torch.bfloat16
+        return dtype
+
+    def _verify_saved(self, out_dir: str, model: nn.Module) -> Dict[str, Any]:
+        verdict: Dict[str, Any] = {"checked": False}
+        try:
+            from safetensors import safe_open  # type: ignore
+
+            expected = {k: tuple(t.shape) for k, t in self._dedupe_state_dict(model).items()}
+            found: Dict[str, Tuple[int, ...]] = {}
+            for name in sorted(os.listdir(out_dir)):
+                if name.endswith(".safetensors"):
+                    with safe_open(os.path.join(out_dir, name), framework="pt") as handle:
+                        for key in handle.keys():
+                            found[key] = tuple(handle.get_slice(key).get_shape())
+            if not found:
+                return verdict
+            mismatched = [k for k, s in expected.items() if k in found and found[k] != s]
+            missing = [k for k in expected if k not in found]
+            verdict.update(
+                checked=True, tensors_expected=len(expected), tensors_found=len(found),
+                shape_mismatches=len(mismatched), missing=len(missing),
+                ok=not mismatched and not missing,
+            )
+        except Exception as exc:
+            verdict["error"] = f"{type(exc).__name__}: {exc}"
+        return verdict
+
+    def _save_everything(self, model: nn.Module, tokenizer: Any) -> Dict[str, Any]:
+        out_dir = self.output_dir
+        os.makedirs(out_dir, exist_ok=True)
+        info: Dict[str, Any] = {"attempts": [], "tokenizer_saved": False}
+        with contextlib.suppress(Exception):
+            model.to("cpu")
+        self._purge_memory()
+        dtype = self._choose_save_dtype(model)
+        self._save_dtype_used = dtype
+        with contextlib.suppress(Exception):
+            model.to(dtype)
+            for attr in ("torch_dtype", "dtype"):
+                if hasattr(model.config, attr):
+                    with contextlib.suppress(Exception):
+                        setattr(model.config, attr, dtype)
+        info["dtype"] = str(dtype).replace("torch.", "")
+
+        shard_kw = {"max_shard_size": self.max_shard_size} if self.max_shard_size else {}
+        attempts: List[Tuple[str, Callable[[], Any]]] = [
+            ("save_pretrained_safetensors", lambda: model.save_pretrained(out_dir, safe_serialization=True, **shard_kw)),
+            ("save_pretrained_default", lambda: model.save_pretrained(out_dir, **shard_kw)),
+            ("manual_safetensors", lambda: self._manual_safetensors(model, out_dir)),
+            ("torch_state_dict", lambda: self._manual_torch_save(model, out_dir)),
+        ]
+        for name, fn in attempts:
+            try:
+                fn()
+                present, files = self._weights_present(out_dir)
+                if not present:
+                    raise RuntimeError("no weight files were written")
+                info.update(method=name, files=files)
+                break
+            except Exception as exc:
+                info["attempts"].append({"method": name, "error": f"{type(exc).__name__}: {exc}"})
+                self._warn(f"save method '{name}' failed: {type(exc).__name__}: {exc}")
+                self._cleanup_partial_weights(out_dir)
+        else:
+            raise MergeError("All save strategies failed; see report attempts.", "save")
+
+        if tokenizer is not None:
+            try:
+                tokenizer.save_pretrained(out_dir)
+                info["tokenizer_saved"] = True
+            except Exception as exc:
+                self._warn(f"tokenizer could not be saved: {type(exc).__name__}: {exc}")
+        info["verification"] = self._verify_saved(out_dir, model)
+        return info
+
+    # ------------------------------------------------------------------
+    # report
+    # ------------------------------------------------------------------
+
+    def _write_report(self) -> Optional[str]:
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            path = os.path.join(self.output_dir, "ftrain_merge_report.json")
+            payload = json.dumps(self._report.to_dict(), indent=2, ensure_ascii=False)
+            fd, tmp = tempfile.mkstemp(dir=self.output_dir, prefix=".ftrain_report_", suffix=".json")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                os.replace(tmp, path)
+            finally:
+                if os.path.exists(tmp):
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp)
+            return path
+        except Exception as exc:
+            logger.warning("Could not write merge report: %s", exc)
+            return None
+
+    def _fill_report_decisions(self, decisions: List[MergeTensorDecision]) -> None:
+        rep = self._report
+        counts: Dict[str, int] = defaultdict(int)
+        by_role: Dict[str, int] = defaultdict(int)
+        by_method: Dict[str, int] = defaultdict(int)
+        cos = delta = conflict = 0.0
+        measured = 0
+        unmatched: List[Dict[str, Any]] = []
+        for d in decisions:
+            counts[f"status_{d.status}"] += 1
+            if d.status == "merged":
+                counts[d.strategy if d.strategy in ("weighted", "slerp", "ties", "fisher", "svd") else "weighted"] += 1
+                if d.shape_aligned:
+                    counts["shape_adapted"] += 1
+                cos += d.cosine
+                delta += d.relative_delta
+                conflict += d.sign_conflict
+                measured += 1
+            by_role[d.role] += 1
+            by_method[d.match_method] += 1
+            if d.status in ("kept_a", "reverted") and d.match_method == "none":
+                unmatched.append({"key": d.target_key, "role": d.role, "shape": list(d.shape_a), "reason": d.reason})
+        counts["matched"] = measured
+        counts["missing"] = len(unmatched)
+        counts["total"] = len(decisions)
+        counts["failed"] = counts.get("status_reverted", 0)
+        rep.counts = dict(counts)
+        rep.mean_cosine = cos / max(1, measured)
+        rep.mean_relative_delta = delta / max(1, measured)
+        rep.mean_conflict = conflict / max(1, measured)
+        rep.matching = {"by_role": dict(by_role), "by_method": dict(by_method)}
+        rep.unmatched = unmatched[:2000]
+        ranked = sorted(decisions, key=lambda d: d.sign_conflict * 2.0 + d.relative_delta, reverse=True)
+        keep = ranked[: self.report_max_tensors]
+        rep.tensor_decisions = [
+            {
+                k: (_round(v) if isinstance(v, float) else v)
+                for k, v in asdict(d).items()
+                if k not in ("notes",) or v
+            }
+            for d in keep
+        ]
+        if len(decisions) > len(keep):
+            rep.warnings.append(f"tensor_decisions truncated to the {len(keep)} most conflicted of {len(decisions)} tensors")
+
+    # ------------------------------------------------------------------
+    # main pipeline
+    # ------------------------------------------------------------------
+
+    def merge(self) -> bool:
+        """Run the merge. Returns True on success, False when the merge was rolled
+        back to Model A (or failed with merge_raise_on_error=False). Fatal errors
+        raise MergeError after a failure report is written."""
+        self._current_stage = "init"
+        started = time.time()
+        try:
+            ok = self._merge_impl()
+        except Exception as exc:
+            stage = getattr(exc, "stage", None) or getattr(self, "_current_stage", "unknown")
+            self._report.status = "failed"
+            self._report.failed_stage = stage
+            self._report.error = f"{type(exc).__name__}: {exc}"
+            self._report.warnings.append(traceback.format_exc(limit=8))
+            self._report.finished_at = time.time()
+            self._report.duration_seconds = self._report.finished_at - started
+            self._write_report()
+            self._say(f"[merge] FAILED in stage '{stage}': {type(exc).__name__}: {exc}", "error")
+            if self.raise_on_error:
+                if isinstance(exc, MergeError):
+                    raise
+                raise MergeError(f"{type(exc).__name__}: {exc}", stage) from exc
+            return False
+        finally:
+            self._model_a_obj = None
+            self._sd_a, self._sd_b = {}, {}
+            self._fisher_elem_a = self._fisher_elem_b = None
+            self._purge_memory()
+        self._report.finished_at = time.time()
+        self._report.duration_seconds = self._report.finished_at - started
+        self._write_report()
+        return ok
+
+    def _merge_impl(self) -> bool:
+        rep = self._report
+        rep.disclaimers = [
+            "Model A is the output architecture; every output tensor has A's shape.",
+            "Cross-architecture adaptation is an experimental heuristic, not an equivalence.",
+        ]
+        self._say("=" * 60)
+        self._say("FTRAIN PHOENIX INTELLIGENT BRAIN MERGER")
+        self._say(f"Model A (output architecture): {self.model_a}")
+        self._say(f"Model B (knowledge source):    {self.model_b}")
+        runtime_device = self._runtime_device()
+        self._say(f"Runtime device: {runtime_device}")
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # ---- load A -----------------------------------------------------
+        with self._stage("load_model_a"):
+            cfg_a = cfg_b = None
+            if _TFConfig is not None:
+                with contextlib.suppress(Exception):
+                    cfg_a = _TFConfig.from_pretrained(self.model_a, trust_remote_code=self.trust_remote_code)
+                with contextlib.suppress(Exception):
+                    cfg_b = _TFConfig.from_pretrained(self.model_b, trust_remote_code=self.trust_remote_code)
+            pre_a = _extract_arch(self.model_a, cfg_a) if cfg_a is not None else ArchInfo(name=self.model_a)
+            pre_b = _extract_arch(self.model_b, cfg_b) if cfg_b is not None else ArchInfo(name=self.model_b)
+            big = max(_estimate_params(pre_a), _estimate_params(pre_b)) > 3_500_000_000
+            pref = self.load_dtype_pref
+            if pref in ("float32", "fp32"):
+                self._compute_dtype = torch.float32
+            elif pref in ("bfloat16", "bf16"):
+                self._compute_dtype = torch.bfloat16
+            elif pref in ("float16", "fp16"):
+                self._compute_dtype = torch.float16
+            else:
+                self._compute_dtype = torch.bfloat16 if big else torch.float32
+            model_a, tok_a = _load_model_any(
+                self.model_a, dtype=self._compute_dtype, trust_remote_code=self.trust_remote_code
+            )
+            self._model_a_obj, self._tok_a = model_a, tok_a
+            self._arch_a = _extract_arch(self.model_a, getattr(model_a, "config", cfg_a), model_a.state_dict())
+
+        # ---- calibration, baseline, Fisher A ------------------------------
+        with self._stage("calibration_and_baseline"):
+            self._build_calibration_loaders(tok_a)
+            baseline = float("inf")
+            if self._loader_val is not None and self.global_loss_tolerance is not None:
+                dev = self._to_device_safely(model_a, runtime_device)
+                baseline = self._evaluate_model(model_a, self._loader_val, dev, max_batches=16)
+                self._say(f"[merge] baseline calibration loss of Model A: {baseline:.5f}")
+            if self.use_fisher and self._loader_train is not None:
+                self._say("[merge] computing Fisher information for Model A ...")
+                self._compute_fisher(model_a, "a")
+            elif self.use_fisher:
+                self._warn("use_fisher requested but there is no calibration data; Fisher skipped.")
+            with contextlib.suppress(Exception):
+                model_a.to("cpu")
+            self._purge_memory()
+
+        # ---- load B ---------------------------------------------------------
+        with self._stage("load_model_b"):
+            model_b, tok_b = _load_model_any(
+                self.model_b, dtype=self._compute_dtype, trust_remote_code=self.trust_remote_code
+            )
+            self._tok_b = tok_b
+            self._arch_b = _extract_arch(self.model_b, getattr(model_b, "config", cfg_b), model_b.state_dict())
+            if self.use_fisher and self._loader_train is not None:
+                if tok_a is not None and tok_b is not None and tok_a.get_vocab() != tok_b.get_vocab():
+                    self._warn(
+                        "Models use different tokenizers: Fisher for B is computed on A-tokenized text "
+                        "and is only a rough importance signal."
+                    )
+                self._say("[merge] computing Fisher information for Model B ...")
+                self._compute_fisher(model_b, "b")
+            with contextlib.suppress(Exception):
+                model_b.to("cpu")
+            try:
+                names_b = {n for n, _ in model_b.named_parameters(remove_duplicate=False)}
+            except TypeError:
+                names_b = {n for n, _ in model_b.named_parameters()}
+            self._param_names_b = names_b
+            self._sd_b = {k: v.detach() for k, v in model_b.state_dict().items()}
+            del model_b
+            self._purge_memory()
+
+        # ---- structure --------------------------------------------------------
+        with self._stage("analyze_structure"):
+            try:
+                names_a = {n for n, _ in model_a.named_parameters(remove_duplicate=False)}
+            except TypeError:
+                names_a = {n for n, _ in model_a.named_parameters()}
+            self._param_names_a = names_a
+            self._sd_a = {k: v.detach() for k, v in model_a.state_dict().items()}
+            self._sig_a = {k: _parse_signature(k) for k in self._sd_a}
+            self._arch_a.layer_ids = sorted({s[0] for k, s in self._sig_a.items() if s[0] is not None})
+            self._index_b = _SourceIndex(self._sd_b.keys(), skip={k for k in self._sd_b if k not in self._param_names_b})
+            self._arch_b.layer_ids = self._index_b.layer_ids
+            self._arch_cmp = _compare_arch(self._arch_a, self._arch_b)
+            self._layer_map = self._build_layer_map(self._arch_a.layer_ids, self._arch_b.layer_ids)
+            ids_a = self._arch_a.layer_ids
+            self._layer_pos_a = {l: (i / max(1, len(ids_a) - 1)) for i, l in enumerate(ids_a)}
+            self._detect_ties()
+
+            # token map
+            self._vocab_map, self._vocab_info = None, {"status": "not_requested"}
+            emb_a = next((t for k, t in self._sd_a.items() if self._sig_a[k][1] == "embedding" and t.ndim == 2), None)
+            emb_b = next((t for k, t in self._sd_b.items() if self._index_b.sig.get(k, (0, "", ""))[1] == "embedding" and t.ndim == 2), None)
+            if self.vocab_mapping and emb_a is not None and emb_b is not None:
+                self._vocab_map, self._vocab_info = _build_vocab_map(tok_a, tok_b, int(emb_a.shape[0]), int(emb_b.shape[0]))
+                self._say(
+                    f"[merge] token map: {self._vocab_info.get('status')} "
+                    f"(coverage {self._vocab_info.get('coverage', 0.0):.1%})"
+                )
+            tokenizer_mismatch = self._vocab_info.get("status") not in ("identical_vocab", "not_requested") and (
+                emb_a is not None and emb_b is not None and tuple(emb_a.shape) != tuple(emb_b.shape)
+                or self._vocab_info.get("status") == "text_matched"
+            )
+            cmp = self._arch_cmp
+            self._cross_arch = bool(cmp["dimension_mismatch"] or cmp["layer_mismatch"] or cmp["family_mismatch"])
+            self._experimental = bool(self._cross_arch or tokenizer_mismatch)
+            if self._experimental and not self.allow_high_alpha_cross_arch:
+                self._alpha_ceiling = self.experimental_alpha_cap
+            rep.cross_architecture = self._cross_arch
+            rep.experimental = self._experimental
+            if self._experimental:
+                rep.disclaimers.append(
+                    "EXPERIMENTAL: the models differ in "
+                    + ", ".join(
+                        n for n, f in (
+                            ("dimensions", cmp["dimension_mismatch"]),
+                            ("depth", cmp["layer_mismatch"]),
+                            ("family", cmp["family_mismatch"]),
+                            ("tokenizer", tokenizer_mismatch),
+                        ) if f
+                    )
+                    + f". Alpha is capped at {self._alpha_ceiling:.2f}; adapted tensors at {self.adapted_alpha_cap:.2f} and update only the part of the tensor B can cover."
+                )
+                self._say("[merge] EXPERIMENTAL cross-architecture merge: conservative settings enforced.")
+            if cmp["semantic_config_differences"]:
+                rep.disclaimers.append(
+                    "Config differences that can reduce weight-space agreement: "
+                    + ", ".join(cmp["semantic_config_differences"])
+                )
+            rep.architecture = {
+                "output_architecture": "model_a",
+                "model_a": asdict(self._arch_a),
+                "model_b": asdict(self._arch_b),
+                "comparison": cmp,
+                "tied_tensors_in_a": len(self._tie_alias),
+                "model_a_parameters": self._arch_a.num_parameters,
+                "model_b_parameters": self._arch_b.num_parameters,
+                "model_a_layers": self._arch_a.num_layers,
+                "model_b_layers": self._arch_b.num_layers,
+            }
+            rep.layer_map = {
+                str(k): [{"layer_b": lb, "weight": round(w, 4)} for lb, w in v]
+                for k, v in self._layer_map.items()
+            }
+            rep.vocab_map = dict(self._vocab_info)
+
+            self._matches = {
+                k: self._match_tensor(k) for k, t in self._sd_a.items()
+                if torch.is_tensor(t) and torch.is_floating_point(t)
+            }
+            n_matched = sum(1 for m in self._matches.values() if m.sources)
+            self._say(f"[merge] matched {n_matched}/{len(self._matches)} floating tensors of Model A")
+
+        # ---- CBA ----------------------------------------------------------------
+        with self._stage("cba"):
+            self._run_cba()
+            rep.cba_used = self._cba_report is not None
+        rep.fisher_used = bool(self._fisher_scalar_a and self._fisher_scalar_b)
+        rep.fisher.setdefault("used", rep.fisher_used)
+
+        # ---- Captain policy ---------------------------------------------------------
+        with self._stage("captain_policy"):
+            if self.captain_model and PhoenixCaptain is not None:
+                try:
+                    from .config import TrainConfig  # type: ignore
+
+                    cap_cfg = TrainConfig(
+                        model_name=self.captain_model, captain_model=self.captain_model,
+                        captain_mode="llm", answer_mode="auto_yes",
+                    )
+                    self.captain = PhoenixCaptain(cap_cfg)
+                except Exception as exc:
+                    self._warn(f"Captain initialization failed: {type(exc).__name__}: {exc}")
+            elif self.captain_model:
+                self._warn("captain_model set but PhoenixCaptain is unavailable; using rule-based policy.")
+            self.policy = self._captain_global_policy()
+            self.captain_policy = self.policy
+            self.strategy = self.policy.strategy
+            rep.strategy = self.strategy
+            rep.captain_policy = asdict(self.policy)
+            self._say(f"[merge] policy ({self.policy.source}): strategy={self.policy.strategy} alpha_b={self.policy.alpha_b:.2f}")
+
+        # ---- merge passes with calibration guard & back-off --------------------------------
+        guard: Dict[str, Any] = {"enabled": False, "baseline_loss": baseline, "attempts": []}
+        scales = [1.0]
+        if self._loader_val is not None and self.global_loss_tolerance is not None and math.isfinite(baseline):
+            guard["enabled"] = True
+            guard["tolerance"] = self.global_loss_tolerance
+            if self.backoff_enabled:
+                scales = [1.0, 0.5, 0.25]
+        accepted = False
+        merged_loss = float("inf")
+        result: Dict[str, Any] = {}
+        for attempt, scale in enumerate(scales):
+            if attempt > 0:
+                self._say(f"[merge] retrying with alpha scale {scale} ...")
+                self._reload_model_a()
+            with self._stage(f"merge_pass_{attempt + 1}"):
+                result = self._merge_pass(scale)
+                self._apply_merged(result["merged"])
+            if not guard["enabled"]:
+                accepted = True
+                break
+            dev = self._to_device_safely(self._model_a_obj, runtime_device)
+            merged_loss = self._evaluate_model(self._model_a_obj, self._loader_val, dev, max_batches=16)
+            limit = baseline * (1.0 + self.global_loss_tolerance)
+            ok = math.isfinite(merged_loss) and merged_loss <= limit
+            guard["attempts"].append({"alpha_scale": scale, "loss": merged_loss, "limit": limit, "accepted": ok})
+            self._say(f"[merge] calibration loss {merged_loss:.5f} (limit {limit:.5f}) -> {'OK' if ok else 'REJECTED'}")
+            with contextlib.suppress(Exception):
+                self._model_a_obj.to("cpu")
+            self._purge_memory()
+            if ok:
+                accepted = True
+                break
+        guard["accepted"] = accepted
+        guard["final_loss"] = merged_loss
+        rep.global_guard = guard
+
+        decisions: List[MergeTensorDecision] = result.get("decisions", [])
+        self._decisions = decisions
+        self._merge_records = [d for d in decisions if d.status == "merged"]
+        self._fill_report_decisions(decisions)
+
+        if not accepted:
+            return self._rollback_to_model_a("calibration guard rejected every alpha scale")
+
+        # ---- safety summary ---------------------------------------------------------------------
+        reverted = [d.target_key for d in decisions if d.status == "reverted"]
+        rep.safety = {
+            "checked": True,
+            "per_tensor_reverts": len(reverted),
+            "reverted_tensors": reverted[:200],
+            "ok": True,
+        }
+
+        # ---- targeted repair ------------------------------------------------------------------------
+        with self._stage("targeted_repair"):
+            adaptation = {"enabled": False, "skipped_reason": "not run"}
+            try:
+                adaptation = self._targeted_adaptation(self._model_a_obj, runtime_device)
+            except Exception as exc:
+                self._warn(f"Targeted repair failed and was skipped: {type(exc).__name__}: {exc}")
+                adaptation = {"enabled": False, "skipped_reason": f"error: {exc}"}
+            rep.adaptation = adaptation
+            with contextlib.suppress(Exception):
+                self._model_a_obj.to("cpu")
+
+        # ---- final safety scan ----------------------------------------------------------------------------
+        with self._stage("final_safety"):
+            bad = [
+                name for name, t in self._model_a_obj.state_dict().items()
+                if torch.is_floating_point(t) and not _finite(t)
+            ]
+            rep.safety["final_nonfinite_tensors"] = len(bad)
+            if bad:
+                self._warn(f"{len(bad)} tensors are non-finite after repair; rolling back to Model A.")
+                return self._rollback_to_model_a("non-finite tensors after repair")
+
+        # ---- save ----------------------------------------------------------------------------------------------------
+        with self._stage("save"):
+            rep.save = self._save_everything(self._model_a_obj, self._tok_a)
+
+        rep.status = "success"
+        self._say("=" * 60)
+        self._say("PHOENIX MERGE COMPLETE")
+        self._say(f"  merged tensors : {rep.counts.get('matched', 0)} / {rep.counts.get('total', 0)}")
+        self._say(f"  kept from A    : {rep.counts.get('status_kept_a', 0)}")
+        self._say(f"  reverted       : {rep.counts.get('status_reverted', 0)}")
+        self._say(f"  shape adapted  : {rep.counts.get('shape_adapted', 0)}")
+        self._say(f"  save method    : {rep.save.get('method')}")
+        self._say(f"  output         : {self.output_dir}")
+        self._say("=" * 60)
+        return True
+
+    # ------------------------------------------------------------------
+    # reload / rollback
+    # ------------------------------------------------------------------
+
+    def _reload_model_a(self) -> None:
+        """Fresh copy of Model A (a merge pass overwrites the container in place)."""
+        self._model_a_obj = None
+        self._sd_a = {}
+        self._purge_memory()
+        model, tok = _load_model_any(self.model_a, dtype=self._compute_dtype, trust_remote_code=self.trust_remote_code)
+        self._model_a_obj = model
+        if tok is not None:
+            self._tok_a = tok
+        self._sd_a = {k: v.detach() for k, v in model.state_dict().items()}
+        self._detect_ties()
+
+    def _rollback_to_model_a(self, reason: str) -> bool:
+        rep = self._report
+        self._warn(f"Rolling back to Model A: {reason}")
+        rep.status = "rolled_back_to_model_a"
+        rep.error = reason
+        if self.rollback_save:
+            with self._stage("rollback_save"):
+                self._reload_model_a()
+                rep.save = self._save_everything(self._model_a_obj, self._tok_a)
+                rep.save["note"] = "output is UNCHANGED Model A because the merge was rolled back"
+        return False
